@@ -127,8 +127,9 @@ pip install -r requirements.txt
 
 1. **克隆或下载仓库**
    ```bash
-   git clone <repository-url>
-   cd mathhomework
+   # 如果您还没有克隆仓库，请使用：
+   # git clone https://github.com/hubzjx/mathhomework.git
+   # cd mathhomework
    ```
 
 2. **安装依赖**
