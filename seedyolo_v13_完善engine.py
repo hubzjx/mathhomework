@@ -999,8 +999,9 @@ class OnnxDetector(BaseDetector):
         self.max_det = max_det
 
     def _preprocess(self, img_bgr):
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.input_size, self.input_size))
+        """优化的预处理：先resize再转换色彩空间"""
+        img = cv2.resize(img_bgr, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))[None, ...]
         return np.ascontiguousarray(img)
@@ -1015,12 +1016,12 @@ class OnnxDetector(BaseDetector):
             img = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
         
-        # 应用下采样
+        # 应用下采样 - 优化：使用INTER_LINEAR以提升速度
         if downsample_ratio != 1.0 and downsample_ratio > 0:
             orig_h, orig_w = img.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img = cv2.resize(img, (new_w, new_h))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -1121,12 +1122,12 @@ class PtDetector(BaseDetector):
             img0 = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
             
-        # 应用下采样
+        # 应用下采样 - 优化：使用INTER_LINEAR以提升速度
         if downsample_ratio != 1.0 and downsample_ratio > 0:
             orig_h, orig_w = img0.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img0 = cv2.resize(img0, (new_w, new_h))
+            img0 = cv2.resize(img0, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -2094,6 +2095,10 @@ class MainWindow(QMainWindow):
         # 下采样参数
         self.downsample_ratio = DOWNSAMPLE_RATIO_DEFAULT
         
+        # 性能优化参数
+        self.frame_skip = 0
+        self.enable_profiling = False
+        
         # 初始化UI
         self.init_ui()
         
@@ -2357,6 +2362,30 @@ class MainWindow(QMainWindow):
         
         downsample_group.setLayout(downsample_layout)
         scroll_layout.addWidget(downsample_group)
+        
+        # ===== 性能优化配置组 =====
+        perf_group = QGroupBox("性能优化配置")
+        perf_layout = QGridLayout()
+        
+        # 帧跳过配置
+        perf_layout.addWidget(QLabel("帧跳过数:"), 0, 0)
+        self.frame_skip_spin = QSpinBox()
+        self.frame_skip_spin.setRange(0, 10)
+        self.frame_skip_spin.setValue(0)
+        self.frame_skip_spin.setToolTip("0=处理所有帧, 1=跳过1帧处理1帧, 2=跳过2帧处理1帧")
+        perf_layout.addWidget(self.frame_skip_spin, 0, 1)
+        
+        # 性能分析开关
+        self.enable_profiling_check = QCheckBox("启用性能分析")
+        self.enable_profiling_check.setChecked(False)
+        self.enable_profiling_check.setToolTip("启用后会在控制台打印详细的性能数据")
+        perf_layout.addWidget(self.enable_profiling_check, 0, 2, 1, 2)
+        
+        # 说明
+        perf_layout.addWidget(QLabel("说明: 帧跳过可以在极端资源受限时使用，以牺牲检测连续性换取FPS"), 1, 0, 1, 4)
+        
+        perf_group.setLayout(perf_layout)
+        scroll_layout.addWidget(perf_group)
         
         # ===== 千粒重配置组 =====
         tkw_group = QGroupBox("千粒重配置")
@@ -2779,6 +2808,10 @@ class MainWindow(QMainWindow):
         # 更新下采样参数
         self.downsample_ratio = float(self.downsample_combo.currentText())
         
+        # 更新性能优化参数
+        self.frame_skip = self.frame_skip_spin.value()
+        self.enable_profiling = self.enable_profiling_check.isChecked()
+        
         # 保存路径与快捷键
         self.base_save_dir = self.save_dir_edit.text().strip() or DEFAULT_SAVE_DIR
         self.hotkey_start = (self.hotkey_start_edit.text().strip() or DEFAULT_HOTKEY_START).upper()[0:1]
@@ -2792,6 +2825,8 @@ class MainWindow(QMainWindow):
         self.log_event(f"  ROI上扩={self.count_line_top_extend}px, ROI下扩={self.count_line_bottom_extend}px")
         self.log_event(f"  计数方向={self.direction_combo.currentText()}")
         self.log_event(f"  下采样比例={self.downsample_ratio:.2f}x")
+        self.log_event(f"  帧跳过数={self.frame_skip}")
+        self.log_event(f"  性能分析={'启用' if self.enable_profiling else '禁用'}")
         self.log_event(f"  YOLO26 NMS={'启用' if USE_NMS_FOR_YOLO26 else '禁用'}")
         self.log_event(f"  保存目录={self.base_save_dir}")
         self.log_event(f"  快捷键 开始={self.hotkey_start}, 结束={self.hotkey_stop}")
@@ -2885,6 +2920,10 @@ class MainWindow(QMainWindow):
         
         # 下采样参数
         self.camera_thread.downsample_ratio = float(self.downsample_combo.currentText())
+        
+        # 性能优化参数
+        self.camera_thread.frame_skip = self.frame_skip_spin.value()
+        self.camera_thread.enable_profiling = self.enable_profiling_check.isChecked()
         
         # 其他参数
         self.camera_thread.counting_direction = "up" if self.direction_combo.currentText() == "向上" else "down"
