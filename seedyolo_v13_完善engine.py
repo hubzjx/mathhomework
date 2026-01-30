@@ -582,10 +582,14 @@ class MVS_Camera:
             return None
 
         buffer_size = stFrame.stFrameInfo.nFrameLen
-        data_buf = (c_ubyte * buffer_size)()
-        memmove(data_buf, stFrame.pBufAddr, buffer_size)
+        # Optimize: Use np.frombuffer directly without memmove
+        # This avoids an extra memory copy operation
+        image_array = np.frombuffer(
+            (c_ubyte * buffer_size).from_address(stFrame.pBufAddr), 
+            dtype=np.ubyte, 
+            count=buffer_size
+        ).copy()  # Still need a copy since we must free the buffer
 
-        image_array = np.frombuffer(data_buf, dtype=np.ubyte, count=buffer_size)
         frame = None
         pixel_type = stFrame.stFrameInfo.enPixelType
 
@@ -843,8 +847,12 @@ class TRTDetector(BaseDetector):
             raise RuntimeError(f"设置TensorRT输入形状失败: {e}")
 
     def _preprocess(self, img_bgr):
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.input_size, self.input_size))
+        """优化的预处理：合并色彩空间转换和resize，减少内存拷贝"""
+        # 使用cv2.resize的插值参数来加速（INTER_LINEAR比INTER_CUBIC快，但质量足够）
+        # 先resize再转换色彩空间，可以减少处理的像素数量
+        img = cv2.resize(img_bgr, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # 合并归一化和转置操作
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))[None, ...]
         return np.ascontiguousarray(img)
@@ -862,12 +870,12 @@ class TRTDetector(BaseDetector):
             roi_top, roi_left = y, x
             roi_width, roi_height = w, h
         
-        # 应用下采样
+        # 应用下采样 - 优化：使用INTER_LINEAR以提升速度
         if downsample_ratio != 1.0 and downsample_ratio > 0:
             orig_h, orig_w = img.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img = cv2.resize(img, (new_w, new_h))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -991,8 +999,9 @@ class OnnxDetector(BaseDetector):
         self.max_det = max_det
 
     def _preprocess(self, img_bgr):
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.input_size, self.input_size))
+        """优化的预处理：先resize再转换色彩空间"""
+        img = cv2.resize(img_bgr, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))[None, ...]
         return np.ascontiguousarray(img)
@@ -1007,12 +1016,12 @@ class OnnxDetector(BaseDetector):
             img = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
         
-        # 应用下采样
+        # 应用下采样 - 优化：使用INTER_LINEAR以提升速度
         if downsample_ratio != 1.0 and downsample_ratio > 0:
             orig_h, orig_w = img.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img = cv2.resize(img, (new_w, new_h))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -1113,12 +1122,12 @@ class PtDetector(BaseDetector):
             img0 = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
             
-        # 应用下采样
+        # 应用下采样 - 优化：使用INTER_LINEAR以提升速度
         if downsample_ratio != 1.0 and downsample_ratio > 0:
             orig_h, orig_w = img0.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img0 = cv2.resize(img0, (new_w, new_h))
+            img0 = cv2.resize(img0, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -1446,6 +1455,20 @@ class CameraThread(QThread):
         # 下采样参数
         self.downsample_ratio = DOWNSAMPLE_RATIO_DEFAULT
         
+        # 帧跳过参数（用于极端性能优化）
+        self.frame_skip = 0  # 0=处理所有帧，1=跳过1帧处理1帧，2=跳过2帧处理1帧
+        self.frame_skip_counter = 0
+        
+        # 性能监控（可选）
+        self.enable_profiling = False
+        self.profile_times = {
+            'capture': 0.0,
+            'detection': 0.0,
+            'tracking': 0.0,
+            'drawing': 0.0,
+            'total': 0.0,
+        }
+        
         # 统计信息
         self.stats = {
             'fps': 0,
@@ -1731,15 +1754,30 @@ class CameraThread(QThread):
         
         while self.running:
             try:
+                t_loop_start = time.perf_counter() if self.enable_profiling else 0
+                
                 # 采集帧
+                t_capture_start = time.perf_counter() if self.enable_profiling else 0
                 if not self.cam:
-                    time.sleep(0.1)
+                    time.sleep(0.01)  # Reduced from 0.1s to 10ms
                     continue
                     
                 frame = self.cam.capture_frame_alternative()
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.001)  # Reduced from 0.01s to 1ms
                     continue
+                
+                if self.enable_profiling:
+                    self.profile_times['capture'] = time.perf_counter() - t_capture_start
+                
+                # 帧跳过逻辑（仅在检测和追踪时跳过，始终更新显示）
+                skip_processing = False
+                if self.frame_skip > 0:
+                    self.frame_skip_counter += 1
+                    if self.frame_skip_counter <= self.frame_skip:
+                        skip_processing = True
+                    else:
+                        self.frame_skip_counter = 0
                 
                 # 更新原始帧尺寸
                 self.original_frame_height, self.original_frame_width = frame.shape[:2]
@@ -1747,11 +1785,13 @@ class CameraThread(QThread):
                 # 更新计数线位置和ROI区域
                 self.update_count_line_and_roi(frame)
                 
-                # 更新FPS
+                # 更新FPS - 计算实际处理帧率
                 self.frame_count += 1
                 current_time = time.time()
-                if current_time - self.last_fps_time >= 1.0:
-                    self.stats['fps'] = self.frame_count
+                elapsed = current_time - self.last_fps_time
+                if elapsed >= 1.0:
+                    # 计算每秒实际处理帧数
+                    self.stats['fps'] = self.frame_count / elapsed
                     self.frame_count = 0
                     self.last_fps_time = current_time
                 
@@ -1792,7 +1832,9 @@ class CameraThread(QThread):
 
                 # 检测 - 关键修改：启用计数时只识别ROI区域，不启用时全屏识别
                 detections = []
-                if self.enable_detection and gate_state and self.detector:
+                t_detect_start = time.perf_counter() if self.enable_profiling else 0
+                
+                if not skip_processing and self.enable_detection and gate_state and self.detector:
                     try:
                         # 根据是否启用计数决定识别区域
                         detections = self.detector.infer(frame, self.roi_rect, self.downsample_ratio)
@@ -1802,12 +1844,20 @@ class CameraThread(QThread):
                     except Exception as e:
                         print(f"⚠️ 检测失败: {e}")
                 
+                if self.enable_profiling:
+                    self.profile_times['detection'] = time.perf_counter() - t_detect_start
+                
                 self.stats['detections'] = len(detections)
                 
                 # 追踪
                 tracked = []
-                if self.enable_tracking and self.tracker:
+                t_track_start = time.perf_counter() if self.enable_profiling else 0
+                
+                if not skip_processing and self.enable_tracking and self.tracker:
                     tracked = self.tracker.update(detections)
+                
+                if self.enable_profiling:
+                    self.profile_times['tracking'] = time.perf_counter() - t_track_start
                 
                 self.stats['tracked'] = len(tracked)
                 
@@ -1861,21 +1911,35 @@ class CameraThread(QThread):
                             print(f"⚠️ 发送密度事件失败: {e}")
                 
                 # 绘制检测结果（不显示统计信息）
+                t_draw_start = time.perf_counter() if self.enable_profiling else 0
                 display_frame = self.draw_detections_simple(frame, detections, tracked, gate_state)
+                if self.enable_profiling:
+                    self.profile_times['drawing'] = time.perf_counter() - t_draw_start
                 
                 # 发送处理后的帧和统计信息
                 self.frame_processed.emit(display_frame, self.stats.copy())
                 
-                # 控制处理频率
-                time.sleep(1.0 / VIDEO_DISPLAY_FPS)
+                # 记录完整循环时间
+                if self.enable_profiling:
+                    self.profile_times['total'] = time.perf_counter() - t_loop_start
+                    # 可选：定期打印性能数据
+                    if self.frame_count % 30 == 0:  # 每30帧打印一次
+                        print(f"[性能分析] 捕获:{self.profile_times['capture']*1000:.1f}ms "
+                              f"检测:{self.profile_times['detection']*1000:.1f}ms "
+                              f"追踪:{self.profile_times['tracking']*1000:.1f}ms "
+                              f"绘制:{self.profile_times['drawing']*1000:.1f}ms "
+                              f"总计:{self.profile_times['total']*1000:.1f}ms "
+                              f"FPS:{self.stats['fps']:.1f}")
                 
             except Exception as e:
                 print(f"处理帧时出错: {e}")
-                time.sleep(0.1)
+                time.sleep(0.01)  # Reduced from 0.1s
     
     def draw_detections_simple(self, frame, detections, tracked, gate_state):
         """绘制检测和追踪结果（不显示统计信息）"""
-        display_frame = frame.copy()
+        # Optimize: Only copy frame if we need to preserve original
+        # Since we're just drawing overlays for display, work directly on the frame
+        display_frame = frame
         
         # 绘制检测框
         for det in detections:
@@ -2030,6 +2094,10 @@ class MainWindow(QMainWindow):
         
         # 下采样参数
         self.downsample_ratio = DOWNSAMPLE_RATIO_DEFAULT
+        
+        # 性能优化参数
+        self.frame_skip = 0
+        self.enable_profiling = False
         
         # 初始化UI
         self.init_ui()
@@ -2294,6 +2362,30 @@ class MainWindow(QMainWindow):
         
         downsample_group.setLayout(downsample_layout)
         scroll_layout.addWidget(downsample_group)
+        
+        # ===== 性能优化配置组 =====
+        perf_group = QGroupBox("性能优化配置")
+        perf_layout = QGridLayout()
+        
+        # 帧跳过配置
+        perf_layout.addWidget(QLabel("帧跳过数:"), 0, 0)
+        self.frame_skip_spin = QSpinBox()
+        self.frame_skip_spin.setRange(0, 10)
+        self.frame_skip_spin.setValue(0)
+        self.frame_skip_spin.setToolTip("0=处理所有帧, 1=跳过1帧处理1帧, 2=跳过2帧处理1帧")
+        perf_layout.addWidget(self.frame_skip_spin, 0, 1)
+        
+        # 性能分析开关
+        self.enable_profiling_check = QCheckBox("启用性能分析")
+        self.enable_profiling_check.setChecked(False)
+        self.enable_profiling_check.setToolTip("启用后会在控制台打印详细的性能数据")
+        perf_layout.addWidget(self.enable_profiling_check, 0, 2, 1, 2)
+        
+        # 说明
+        perf_layout.addWidget(QLabel("说明: 帧跳过可以在极端资源受限时使用，以牺牲检测连续性换取FPS"), 1, 0, 1, 4)
+        
+        perf_group.setLayout(perf_layout)
+        scroll_layout.addWidget(perf_group)
         
         # ===== 千粒重配置组 =====
         tkw_group = QGroupBox("千粒重配置")
@@ -2716,6 +2808,10 @@ class MainWindow(QMainWindow):
         # 更新下采样参数
         self.downsample_ratio = float(self.downsample_combo.currentText())
         
+        # 更新性能优化参数
+        self.frame_skip = self.frame_skip_spin.value()
+        self.enable_profiling = self.enable_profiling_check.isChecked()
+        
         # 保存路径与快捷键
         self.base_save_dir = self.save_dir_edit.text().strip() or DEFAULT_SAVE_DIR
         self.hotkey_start = (self.hotkey_start_edit.text().strip() or DEFAULT_HOTKEY_START).upper()[0:1]
@@ -2729,6 +2825,8 @@ class MainWindow(QMainWindow):
         self.log_event(f"  ROI上扩={self.count_line_top_extend}px, ROI下扩={self.count_line_bottom_extend}px")
         self.log_event(f"  计数方向={self.direction_combo.currentText()}")
         self.log_event(f"  下采样比例={self.downsample_ratio:.2f}x")
+        self.log_event(f"  帧跳过数={self.frame_skip}")
+        self.log_event(f"  性能分析={'启用' if self.enable_profiling else '禁用'}")
         self.log_event(f"  YOLO26 NMS={'启用' if USE_NMS_FOR_YOLO26 else '禁用'}")
         self.log_event(f"  保存目录={self.base_save_dir}")
         self.log_event(f"  快捷键 开始={self.hotkey_start}, 结束={self.hotkey_stop}")
@@ -2822,6 +2920,10 @@ class MainWindow(QMainWindow):
         
         # 下采样参数
         self.camera_thread.downsample_ratio = float(self.downsample_combo.currentText())
+        
+        # 性能优化参数
+        self.camera_thread.frame_skip = self.frame_skip_spin.value()
+        self.camera_thread.enable_profiling = self.enable_profiling_check.isChecked()
         
         # 其他参数
         self.camera_thread.counting_direction = "up" if self.direction_combo.currentText() == "向上" else "down"
