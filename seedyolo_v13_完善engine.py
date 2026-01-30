@@ -1651,6 +1651,38 @@ class CameraThread(QThread):
         else:
             self.base_save_dir = DEFAULT_SAVE_DIR
     
+    def set_inference_fps(self, fps: int):
+        """动态更新推理帧率"""
+        self.inference_fps = max(1, fps)
+        self.inference_interval = 1.0 / self.inference_fps
+        if self.inference_worker:
+            self.inference_worker.set_inference_fps(fps)
+    
+    def set_detection_input_size(self, size: int):
+        """动态更新检测输入尺寸（需要重新加载模型）"""
+        self.detection_input_size = size
+        # 注意：改变输入尺寸需要重新初始化检测器
+    
+    def set_enable_nms(self, enable: bool):
+        """动态更新NMS开关"""
+        self.enable_nms = enable
+        if self.detector:
+            self.detector.enable_nms = enable
+        if self.inference_worker:
+            self.inference_worker.set_enable_nms(enable)
+    
+    def set_top_k_detections(self, top_k: int):
+        """动态更新Top-K检测限制"""
+        self.top_k_detections = max(10, top_k)
+        if self.inference_worker:
+            self.inference_worker.set_top_k(self.top_k_detections)
+    
+    def set_downsample_ratio(self, ratio: float):
+        """动态更新下采样比例"""
+        self.downsample_ratio = max(0.1, min(1.0, ratio))
+        if self.inference_worker:
+            self.inference_worker.set_downsample_ratio(self.downsample_ratio)
+    
     def update_count_line_and_roi(self, frame):
         """根据计数线百分比和扩展像素数更新计数线位置和ROI区域"""
         if frame is None:
