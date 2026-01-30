@@ -176,6 +176,14 @@ COUNT_LINE_BOTTOM_EXTEND_DEFAULT = 100  # 向下扩展像素数
 DOWNSAMPLE_RATIO_DEFAULT = 1.0   # 默认不下采样
 DOWNSAMPLE_OPTIONS = [1.0, 0.75, 0.5, 0.25]  # 下采样选项
 
+# 性能优化参数
+INFERENCE_FPS_DEFAULT = 30  # 默认推理帧率
+INFERENCE_FPS_OPTIONS = [1, 3, 5, 10, 15, 20, 30, 60]  # 推理帧率选项
+DETECTION_INPUT_SIZE_DEFAULT = 640  # 检测输入尺寸
+DETECTION_INPUT_SIZE_OPTIONS = [320, 416, 512, 640, 800, 1024]  # 检测输入尺寸选项
+ENABLE_NMS_DEFAULT = True  # 默认启用NMS
+TOP_K_DETECTIONS = 300  # Top-K检测数量限制（在NMS前应用）
+
 # ===== CRC16 (CCITT-FALSE) =====
 def crc16_ccitt_false(data: bytes, poly=0x1021, init=0xFFFF) -> int:
     crc = init
@@ -790,7 +798,7 @@ class BaseDetector:
 
 
 class TRTDetector(BaseDetector):
-    def __init__(self, engine_path, input_size=640, conf_thres=0.15, iou_thres=0.10, max_det=MAX_DETECTIONS):
+    def __init__(self, engine_path, input_size=640, conf_thres=0.15, iou_thres=0.10, max_det=MAX_DETECTIONS, enable_nms=ENABLE_NMS_DEFAULT):
         if not TRT_AVAILABLE:
             raise RuntimeError("TensorRT/pycuda 不可用，无法加载 .engine")
         self.engine_path = engine_path
@@ -798,6 +806,7 @@ class TRTDetector(BaseDetector):
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
         self.max_det = max_det
+        self.enable_nms = enable_nms
 
         self.logger = trt.Logger(trt.Logger.ERROR)
         with open(engine_path, 'rb') as f, trt.Runtime(self.logger) as runtime:
@@ -950,7 +959,7 @@ class TRTDetector(BaseDetector):
                     dets.append({'bbox': [x1, y1, x2, y2], 'confidence': final_conf, 'class': int(cls_id), 'label': f'class_{int(cls_id)}'})
         
         # 可选的NMS处理（对于端到端模型可以关闭）
-        if USE_NMS_FOR_YOLO26 and len(dets) > 0:
+        if self.enable_nms and len(dets) > 0:
             dets = self._apply_nms(dets)
             
         return dets
@@ -976,7 +985,7 @@ class TRTDetector(BaseDetector):
 
 
 class OnnxDetector(BaseDetector):
-    def __init__(self, onnx_path, input_size=640, conf_thres=0.15, iou_thres=0.10, max_det=MAX_DETECTIONS):
+    def __init__(self, onnx_path, input_size=640, conf_thres=0.15, iou_thres=0.10, max_det=MAX_DETECTIONS, enable_nms=ENABLE_NMS_DEFAULT):
         import onnxruntime as ort
         # 创建会话选项，设置日志级别减少输出
         so = ort.SessionOptions()
@@ -989,6 +998,7 @@ class OnnxDetector(BaseDetector):
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
         self.max_det = max_det
+        self.enable_nms = enable_nms
 
     def _preprocess(self, img_bgr):
         img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -1067,7 +1077,7 @@ class OnnxDetector(BaseDetector):
                 print(f"⚠️ 解析YOLO26输出时出错: {e}")
         
         # 可选的NMS处理
-        if USE_NMS_FOR_YOLO26 and len(dets) > 0:
+        if self.enable_nms and len(dets) > 0:
             dets = self._apply_nms(dets)
             
         return dets
@@ -1092,13 +1102,14 @@ class OnnxDetector(BaseDetector):
 
 
 class PtDetector(BaseDetector):
-    def __init__(self, pt_path, input_size=640, conf_thres=0.15, iou_thres=0.10, max_det=MAX_DETECTIONS, use_cpu=False):
+    def __init__(self, pt_path, input_size=640, conf_thres=0.15, iou_thres=0.10, max_det=MAX_DETECTIONS, use_cpu=False, enable_nms=ENABLE_NMS_DEFAULT):
         if not TORCH_AVAILABLE or not YOLOV5_CODE_AVAILABLE:
             raise RuntimeError("Torch 或 yolov5 代码不可用，无法加载 .pt")
         self.input_size = input_size
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
         self.max_det = max_det
+        self.enable_nms = enable_nms
         device = torch.device('cpu') if use_cpu else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = DetectMultiBackend(pt_path, device=device)
         self.names = self.model.names
@@ -1170,19 +1181,19 @@ def choose_model_file(default_path=DEFAULT_MODEL_PATH):
     return None
 
 
-def create_detector(model_path):
+def create_detector(model_path, input_size=DETECTION_INPUT_SIZE_DEFAULT, enable_nms=ENABLE_NMS_DEFAULT):
     if model_path is None:
         raise RuntimeError("未找到模型文件，请放置 yolov12sbest.engine 或其他候选文件")
     ext = os.path.splitext(model_path)[1].lower()
     if ext == ".engine":
         print(f"🔧 使用 TensorRT Engine: {model_path}")
-        return TRTDetector(model_path)
+        return TRTDetector(model_path, input_size=input_size, enable_nms=enable_nms)
     if ext == ".onnx":
         print(f"🔧 使用 ONNXRuntime: {model_path}")
-        return OnnxDetector(model_path)
+        return OnnxDetector(model_path, input_size=input_size, enable_nms=enable_nms)
     if ext == ".pt":
         print(f"🔧 使用 PyTorch(.pt): {model_path}")
-        return PtDetector(model_path)
+        return PtDetector(model_path, input_size=input_size, enable_nms=enable_nms)
     raise RuntimeError(f"不支持的模型后缀: {ext}")
 
 
@@ -1409,6 +1420,128 @@ class SegmentCache(threading.Thread):
         self.stop_flag.set()
 
 
+# ===== 线程安全的最新帧持有者 =====
+class LatestFrameHolder:
+    """线程安全的持有最新帧，供推理线程读取"""
+    def __init__(self):
+        self.frame = None
+        self.lock = threading.Lock()
+        self.frame_id = 0
+    
+    def update(self, frame):
+        """更新最新帧（采集线程调用）"""
+        with self.lock:
+            self.frame = frame
+            self.frame_id += 1
+    
+    def get(self):
+        """获取最新帧及其ID（推理线程调用）"""
+        with self.lock:
+            return self.frame, self.frame_id
+
+
+class InferenceWorker(threading.Thread):
+    """独立的推理线程，从LatestFrameHolder获取帧并推理"""
+    def __init__(self, frame_holder, result_callback):
+        super().__init__(daemon=True)
+        self.frame_holder = frame_holder
+        self.result_callback = result_callback  # 回调函数接收 (frame, detections, timing_dict)
+        self.running = False
+        self.detector = None
+        self.roi_rect = None
+        self.downsample_ratio = 1.0
+        self.inference_interval = 1.0 / INFERENCE_FPS_DEFAULT
+        self.last_processed_id = -1
+        self.enable_nms = ENABLE_NMS_DEFAULT
+        self.top_k_detections = TOP_K_DETECTIONS
+    
+    def set_detector(self, detector):
+        """设置检测器"""
+        self.detector = detector
+    
+    def set_roi(self, roi_rect):
+        """设置ROI区域"""
+        self.roi_rect = roi_rect
+    
+    def set_downsample_ratio(self, ratio):
+        """设置下采样比例"""
+        self.downsample_ratio = ratio
+    
+    def set_inference_fps(self, fps):
+        """设置推理帧率"""
+        self.inference_interval = 1.0 / max(1, fps)
+    
+    def set_enable_nms(self, enable):
+        """设置是否启用NMS"""
+        self.enable_nms = enable
+    
+    def set_top_k(self, top_k):
+        """设置Top-K检测限制"""
+        self.top_k_detections = top_k
+    
+    def run(self):
+        """推理线程主循环"""
+        self.running = True
+        last_inference_time = 0
+        
+        while self.running:
+            try:
+                current_time = time.time()
+                
+                # 控制推理频率
+                if current_time - last_inference_time < self.inference_interval:
+                    time.sleep(0.001)  # 短暂休眠避免空转
+                    continue
+                
+                # 获取最新帧
+                frame, frame_id = self.frame_holder.get()
+                
+                # 跳过已处理的帧
+                if frame is None or frame_id == self.last_processed_id:
+                    time.sleep(0.001)
+                    continue
+                
+                self.last_processed_id = frame_id
+                
+                # 执行推理
+                detections = []
+                timing = {'inference': 0, 'nms': 0}
+                
+                if self.detector:
+                    t_start = time.perf_counter()
+                    
+                    # 调用检测器推理
+                    detections = self.detector.infer(frame, self.roi_rect, self.downsample_ratio)
+                    
+                    t_infer = time.perf_counter()
+                    timing['inference'] = t_infer - t_start
+                    
+                    # 应用Top-K限制（在NMS前）
+                    if len(detections) > self.top_k_detections:
+                        # 按置信度排序并取Top-K
+                        detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:self.top_k_detections]
+                    
+                    # 可选的NMS（如果检测器内部没有应用或需要重新应用）
+                    # 注意：检测器内部可能已经应用了NMS，这里提供额外控制
+                    
+                    t_nms = time.perf_counter()
+                    timing['nms'] = t_nms - t_infer
+                
+                # 回调返回结果
+                if self.result_callback:
+                    self.result_callback(frame, detections, timing)
+                
+                last_inference_time = current_time
+                
+            except Exception as e:
+                print(f"⚠️ 推理线程出错: {e}")
+                time.sleep(0.1)
+    
+    def stop(self):
+        """停止推理线程"""
+        self.running = False
+
+
 # ===== UI 线程 =====
 class CameraThread(QThread):
     """相机采集和处理的线程"""
@@ -1445,6 +1578,31 @@ class CameraThread(QThread):
         
         # 下采样参数
         self.downsample_ratio = DOWNSAMPLE_RATIO_DEFAULT
+        
+        # 性能优化参数
+        self.inference_fps = INFERENCE_FPS_DEFAULT  # 推理帧率
+        self.detection_input_size = DETECTION_INPUT_SIZE_DEFAULT  # 检测输入尺寸
+        self.enable_nms = ENABLE_NMS_DEFAULT  # 是否启用NMS
+        self.top_k_detections = TOP_K_DETECTIONS  # Top-K检测限制
+        self.inference_interval = 1.0 / INFERENCE_FPS_DEFAULT  # 推理间隔
+        self.last_inference_time = 0  # 上次推理时间
+        
+        # 性能计时
+        self.timing_stats = {
+            'capture': 0,
+            'preprocess': 0,
+            'inference': 0,
+            'postprocess': 0,
+            'tracking': 0,
+            'render': 0,
+            'total': 0
+        }
+        
+        # 线程化推理组件
+        self.frame_holder = LatestFrameHolder()
+        self.inference_worker = None  # 将在初始化后创建
+        self.latest_detections = []
+        self.detection_lock = threading.Lock()
         
         # 统计信息
         self.stats = {
@@ -1635,7 +1793,7 @@ class CameraThread(QThread):
             
             # 初始化检测器
             if model_path:
-                self.detector = create_detector(model_path)
+                self.detector = create_detector(model_path, input_size=self.detection_input_size, enable_nms=self.enable_nms)
                 print(f"✅ 检测器初始化成功: {model_path}")
             else:
                 raise RuntimeError("未指定模型路径")
@@ -1703,6 +1861,17 @@ class CameraThread(QThread):
             self.counted_objects.clear()
             self.event_id = 1
             
+            # 初始化推理线程
+            self.inference_worker = InferenceWorker(self.frame_holder, self._on_inference_result)
+            self.inference_worker.set_detector(self.detector)
+            self.inference_worker.set_roi(self.roi_rect)
+            self.inference_worker.set_downsample_ratio(self.downsample_ratio)
+            self.inference_worker.set_inference_fps(self.inference_fps)
+            self.inference_worker.set_enable_nms(self.enable_nms)
+            self.inference_worker.set_top_k(self.top_k_detections)
+            self.inference_worker.start()
+            print(f"✅ 推理线程已启动 (FPS: {self.inference_fps})")
+            
             print("✅ 系统初始化完成")
             return True
         except Exception as e:
@@ -1711,9 +1880,21 @@ class CameraThread(QThread):
             self._cleanup_resources()
             return False
     
+    def _on_inference_result(self, frame, detections, timing):
+        """推理结果回调（由推理线程调用）"""
+        with self.detection_lock:
+            self.latest_detections = detections
+            self.timing_stats['inference'] = timing.get('inference', 0) * 1000  # 转换为ms
+            self.timing_stats['postprocess'] = timing.get('nms', 0) * 1000  # 转换为ms
+    
     def _cleanup_resources(self):
         """清理资源"""
         try:
+            # 停止推理线程
+            if hasattr(self, 'inference_worker') and self.inference_worker:
+                self.inference_worker.stop()
+                self.inference_worker.join(timeout=2.0)
+            
             if self.cam:
                 self.cam.close()
             if hasattr(self, 'uart_rx') and self.uart_rx:
@@ -1726,19 +1907,30 @@ class CameraThread(QThread):
             print(f"清理资源时出错: {e}")
     
     def run(self):
-        """线程主循环"""
+        """线程主循环 - 优化版本，使用独立推理线程"""
         self.running = True
+        
+        # 用于 FPS 计算
+        display_frame_count = 0
+        display_fps_time = time.time()
+        capture_fps = 0
         
         while self.running:
             try:
+                t_loop_start = time.perf_counter()
+                
                 # 采集帧
                 if not self.cam:
                     time.sleep(0.1)
                     continue
-                    
+                
+                t_cap_start = time.perf_counter()
                 frame = self.cam.capture_frame_alternative()
+                t_cap_end = time.perf_counter()
+                self.timing_stats['capture'] = (t_cap_end - t_cap_start) * 1000
+                
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.001)
                     continue
                 
                 # 更新原始帧尺寸
@@ -1747,13 +1939,21 @@ class CameraThread(QThread):
                 # 更新计数线位置和ROI区域
                 self.update_count_line_and_roi(frame)
                 
-                # 更新FPS
-                self.frame_count += 1
+                # 更新采集FPS
+                display_frame_count += 1
                 current_time = time.time()
-                if current_time - self.last_fps_time >= 1.0:
-                    self.stats['fps'] = self.frame_count
-                    self.frame_count = 0
-                    self.last_fps_time = current_time
+                if current_time - display_fps_time >= 1.0:
+                    capture_fps = display_frame_count
+                    self.stats['fps'] = capture_fps
+                    display_frame_count = 0
+                    display_fps_time = current_time
+                
+                # 将最新帧发送给推理线程（不阻塞）
+                if self.enable_detection and self.inference_worker:
+                    self.frame_holder.update(frame)
+                    # 更新推理参数（如果有变化）
+                    self.inference_worker.set_roi(self.roi_rect)
+                    self.inference_worker.set_downsample_ratio(self.downsample_ratio)
                 
                 t_cap_host = time.monotonic()
                 
@@ -1790,17 +1990,12 @@ class CameraThread(QThread):
                             self._finalize_long_capture(trigger="uart_speed_non_positive")
                 # UART 关闭时不自动控制，由快捷键/按钮触发
 
-                # 检测 - 关键修改：启用计数时只识别ROI区域，不启用时全屏识别
+                # 获取最新的推理结果（非阻塞）
                 detections = []
-                if self.enable_detection and gate_state and self.detector:
-                    try:
-                        # 根据是否启用计数决定识别区域
-                        detections = self.detector.infer(frame, self.roi_rect, self.downsample_ratio)
-                        # 应用最大检测数量限制
-                        if len(detections) > self.max_detections:
-                            detections = detections[:self.max_detections]
-                    except Exception as e:
-                        print(f"⚠️ 检测失败: {e}")
+                t_tracking_start = time.perf_counter()
+                if self.enable_detection and gate_state:
+                    with self.detection_lock:
+                        detections = self.latest_detections.copy()
                 
                 self.stats['detections'] = len(detections)
                 
@@ -1808,6 +2003,9 @@ class CameraThread(QThread):
                 tracked = []
                 if self.enable_tracking and self.tracker:
                     tracked = self.tracker.update(detections)
+                
+                t_tracking_end = time.perf_counter()
+                self.timing_stats['tracking'] = (t_tracking_end - t_tracking_start) * 1000
                 
                 self.stats['tracked'] = len(tracked)
                 
@@ -1861,16 +2059,29 @@ class CameraThread(QThread):
                             print(f"⚠️ 发送密度事件失败: {e}")
                 
                 # 绘制检测结果（不显示统计信息）
+                t_render_start = time.perf_counter()
                 display_frame = self.draw_detections_simple(frame, detections, tracked, gate_state)
+                t_render_end = time.perf_counter()
+                self.timing_stats['render'] = (t_render_end - t_render_start) * 1000
+                
+                # 总时间
+                t_loop_end = time.perf_counter()
+                self.timing_stats['total'] = (t_loop_end - t_loop_start) * 1000
+                
+                # 添加计时信息到统计
+                self.stats['timing'] = self.timing_stats.copy()
                 
                 # 发送处理后的帧和统计信息
                 self.frame_processed.emit(display_frame, self.stats.copy())
                 
-                # 控制处理频率
+                # 控制UI刷新频率（解耦于推理频率）
+                # 使用更小的休眠时间以保持UI响应性
                 time.sleep(1.0 / VIDEO_DISPLAY_FPS)
                 
             except Exception as e:
                 print(f"处理帧时出错: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(0.1)
     
     def draw_detections_simple(self, frame, detections, tracked, gate_state):
@@ -2295,6 +2506,48 @@ class MainWindow(QMainWindow):
         downsample_group.setLayout(downsample_layout)
         scroll_layout.addWidget(downsample_group)
         
+        # ===== 性能优化配置组 =====
+        perf_group = QGroupBox("性能优化配置")
+        perf_layout = QGridLayout()
+        
+        # 推理帧率选择
+        perf_layout.addWidget(QLabel("推理帧率(FPS):"), 0, 0)
+        self.inference_fps_combo = QComboBox()
+        for fps in INFERENCE_FPS_OPTIONS:
+            self.inference_fps_combo.addItem(f"{fps}")
+        self.inference_fps_combo.setCurrentText(f"{INFERENCE_FPS_DEFAULT}")
+        perf_layout.addWidget(self.inference_fps_combo, 0, 1)
+        
+        # 检测输入尺寸选择
+        perf_layout.addWidget(QLabel("检测输入尺寸:"), 0, 2)
+        self.detection_size_combo = QComboBox()
+        for size in DETECTION_INPUT_SIZE_OPTIONS:
+            self.detection_size_combo.addItem(f"{size}")
+        self.detection_size_combo.setCurrentText(f"{DETECTION_INPUT_SIZE_DEFAULT}")
+        perf_layout.addWidget(self.detection_size_combo, 0, 3)
+        
+        # NMS开关
+        perf_layout.addWidget(QLabel("启用NMS:"), 1, 0)
+        self.enable_nms_check = QCheckBox()
+        self.enable_nms_check.setChecked(ENABLE_NMS_DEFAULT)
+        perf_layout.addWidget(self.enable_nms_check, 1, 1)
+        
+        # Top-K检测数量
+        perf_layout.addWidget(QLabel("Top-K检测限制:"), 1, 2)
+        self.topk_spin = QSpinBox()
+        self.topk_spin.setRange(10, 5000)
+        self.topk_spin.setValue(TOP_K_DETECTIONS)
+        self.topk_spin.setSingleStep(50)
+        perf_layout.addWidget(self.topk_spin, 1, 3)
+        
+        # 性能优化说明
+        perf_info = QLabel("说明: 降低推理帧率、检测输入尺寸可大幅提升FPS；Top-K限制在NMS前应用")
+        perf_info.setWordWrap(True)
+        perf_layout.addWidget(perf_info, 2, 0, 1, 4)
+        
+        perf_group.setLayout(perf_layout)
+        scroll_layout.addWidget(perf_group)
+        
         # ===== 千粒重配置组 =====
         tkw_group = QGroupBox("千粒重配置")
         tkw_layout = QGridLayout()
@@ -2653,6 +2906,43 @@ class MainWindow(QMainWindow):
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
         
+        # 性能计时组
+        perf_group = QGroupBox("性能计时 (ms)")
+        perf_layout = QGridLayout()
+        
+        # 采集耗时
+        perf_layout.addWidget(QLabel("采集:"), 0, 0)
+        self.timing_capture_label = QLabel("0.0")
+        perf_layout.addWidget(self.timing_capture_label, 0, 1)
+        
+        # 推理耗时
+        perf_layout.addWidget(QLabel("推理:"), 0, 2)
+        self.timing_inference_label = QLabel("0.0")
+        perf_layout.addWidget(self.timing_inference_label, 0, 3)
+        
+        # 后处理耗时
+        perf_layout.addWidget(QLabel("后处理:"), 1, 0)
+        self.timing_postprocess_label = QLabel("0.0")
+        perf_layout.addWidget(self.timing_postprocess_label, 1, 1)
+        
+        # 追踪耗时
+        perf_layout.addWidget(QLabel("追踪:"), 1, 2)
+        self.timing_tracking_label = QLabel("0.0")
+        perf_layout.addWidget(self.timing_tracking_label, 1, 3)
+        
+        # 渲染耗时
+        perf_layout.addWidget(QLabel("渲染:"), 2, 0)
+        self.timing_render_label = QLabel("0.0")
+        perf_layout.addWidget(self.timing_render_label, 2, 1)
+        
+        # 总耗时
+        perf_layout.addWidget(QLabel("总计:"), 2, 2)
+        self.timing_total_label = QLabel("0.0")
+        perf_layout.addWidget(self.timing_total_label, 2, 3)
+        
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+        
         # 事件日志组
         log_group = QGroupBox("事件日志")
         log_layout = QVBoxLayout()
@@ -2823,6 +3113,13 @@ class MainWindow(QMainWindow):
         # 下采样参数
         self.camera_thread.downsample_ratio = float(self.downsample_combo.currentText())
         
+        # 性能优化参数
+        self.camera_thread.inference_fps = int(self.inference_fps_combo.currentText())
+        self.camera_thread.detection_input_size = int(self.detection_size_combo.currentText())
+        self.camera_thread.enable_nms = self.enable_nms_check.isChecked()
+        self.camera_thread.top_k_detections = self.topk_spin.value()
+        self.camera_thread.inference_interval = 1.0 / max(1, self.camera_thread.inference_fps)
+        
         # 其他参数
         self.camera_thread.counting_direction = "up" if self.direction_combo.currentText() == "向上" else "down"
         self.camera_thread.max_detections = self.max_det_spin.value()
@@ -2863,6 +3160,10 @@ class MainWindow(QMainWindow):
         self.log_event(f"  下采样: {self.downsample_ratio:.2f}x")
         self.log_event(f"  计数方向: {self.direction_combo.currentText()}")
         self.log_event(f"  计数模式: {'启用' if self.counting_check.isChecked() else '禁用'}")
+        self.log_event(f"  推理FPS: {self.camera_thread.inference_fps}")
+        self.log_event(f"  检测输入尺寸: {self.camera_thread.detection_input_size}")
+        self.log_event(f"  NMS: {'启用' if self.camera_thread.enable_nms else '禁用'}")
+        self.log_event(f"  Top-K限制: {self.camera_thread.top_k_detections}")
     
     def stop_system(self):
         """停止系统"""
@@ -3157,6 +3458,16 @@ class MainWindow(QMainWindow):
                 
                 # 计数方向
                 self.counting_direction_label.setText(self.direction_combo.currentText())
+                
+                # 性能计时信息
+                if 'timing' in self.stats:
+                    timing = self.stats['timing']
+                    self.timing_capture_label.setText(f"{timing.get('capture', 0):.1f}")
+                    self.timing_inference_label.setText(f"{timing.get('inference', 0):.1f}")
+                    self.timing_postprocess_label.setText(f"{timing.get('postprocess', 0):.1f}")
+                    self.timing_tracking_label.setText(f"{timing.get('tracking', 0):.1f}")
+                    self.timing_render_label.setText(f"{timing.get('render', 0):.1f}")
+                    self.timing_total_label.setText(f"{timing.get('total', 0):.1f}")
         
         # 更新状态栏
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
