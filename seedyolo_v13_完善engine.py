@@ -150,12 +150,18 @@ CACHE_ROTATE_KEEP = 5  # 最多保留 5 个历史文件
 
 # UI相关配置
 UI_UPDATE_INTERVAL = 30  # ms
-VIDEO_DISPLAY_FPS = 30   # 视频显示帧率
+VIDEO_DISPLAY_FPS = 30   # 视频显示帧率（仅用于UI刷新）
+UI_ONLY_FPS_LIMIT = True  # True=仅UI限制FPS，False=在采集循环中限制
 
 # 检测器配置
 USE_NMS_FOR_YOLO26 = True  # 对于YOLO26端到端模型，可设为False
 YOLO26_CONF_THRES = 0.15   # YOLO26专用置信度阈值
 MAX_DETECTIONS = 20000     # 最大检测数量限制
+TOP_K_BEFORE_NMS = 1000    # NMS前保留的最高置信度候选数量（优化性能）
+
+# 推理配置
+INFERENCE_INTERVAL = 1     # 推理间隔（帧），1=每帧推理，2=每2帧推理...
+DETECTOR_DOWNSAMPLE_RATIO = 1.0  # 检测器专用下采样（独立于显示下采样）
 
 # EVENT 发送队列
 EVENT_QUEUE_MAX = 2000
@@ -198,6 +204,39 @@ def grams_to_mg_u32(grams: float) -> int:
     """把克重转换为毫克并用 uint32 表示（避免浮点传输）。"""
     mg = int(round(max(0.0, grams) * 1000.0))
     return max(0, min(0xFFFFFFFF, mg))
+
+
+# ===== 性能计时器 =====
+class PerformanceTimer:
+    """用于跟踪各阶段性能的计时器"""
+    def __init__(self):
+        self.timings = {
+            'capture': 0.0,
+            'preprocess': 0.0,
+            'inference': 0.0,
+            'postprocess': 0.0,
+            'draw': 0.0,
+            'total': 0.0
+        }
+        self.counts = {k: 0 for k in self.timings.keys()}
+    
+    def update(self, stage, duration):
+        """更新某个阶段的时间"""
+        if stage in self.timings:
+            # 使用指数移动平均
+            alpha = 0.1
+            self.timings[stage] = alpha * duration + (1 - alpha) * self.timings[stage]
+            self.counts[stage] += 1
+    
+    def get_timings(self):
+        """获取当前计时信息"""
+        return self.timings.copy()
+    
+    def get_fps_estimate(self):
+        """基于total时间估算FPS"""
+        if self.timings['total'] > 0:
+            return 1.0 / self.timings['total']
+        return 0.0
 
 
 # ===== 控制数据结构与对齐 =====
@@ -843,21 +882,30 @@ class TRTDetector(BaseDetector):
             raise RuntimeError(f"设置TensorRT输入形状失败: {e}")
 
     def _preprocess(self, img_bgr):
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.input_size, self.input_size))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]
-        return np.ascontiguousarray(img)
+        """优化的预处理：最小化内存拷贝"""
+        # 直接在resize中进行插值，避免额外的copy
+        img_resized = cv2.resize(img_bgr, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        
+        # 使用cvtColor直接转换
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        
+        # 归一化并转换为float32
+        img_normalized = img_rgb.astype(np.float32) * (1.0 / 255.0)
+        
+        # 转置并添加batch维度
+        img_transposed = np.transpose(img_normalized, (2, 0, 1))[None, ...]
+        
+        return np.ascontiguousarray(img_transposed)
 
     def infer(self, frame_bgr, roi=None, downsample_ratio=1.0):
-        # 如果没有ROI，则全屏识别
+        # ROI提取（使用view）
         if roi is None:
             img = frame_bgr
             roi_top, roi_left = 0, 0
-            # 不启用计数时，使用全屏，但为了统一，我们设置roi为全屏
             roi_width, roi_height = img.shape[1], img.shape[0]
         else:
             x, y, w, h = roi
+            # 使用numpy的view而不是copy
             img = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
             roi_width, roi_height = w, h
@@ -867,7 +915,8 @@ class TRTDetector(BaseDetector):
             orig_h, orig_w = img.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img = cv2.resize(img, (new_w, new_h))
+            # 使用INTER_LINEAR进行快速下采样
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -956,16 +1005,28 @@ class TRTDetector(BaseDetector):
         return dets
     
     def _apply_nms(self, detections):
-        """应用非极大值抑制"""
+        """应用非极大值抑制（带top-k预过滤优化）"""
         if not detections:
             return []
+        
+        # Top-K预过滤：按置信度排序，只保留前TOP_K_BEFORE_NMS个
+        if len(detections) > TOP_K_BEFORE_NMS:
+            detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:TOP_K_BEFORE_NMS]
         
         boxes = np.array([d['bbox'] for d in detections])
         scores = np.array([d['confidence'] for d in detections])
         
+        # 转换boxes从xyxy格式到xywh格式（OpenCV NMS要求xywh）
+        # boxes当前是 [x1, y1, x2, y2]，需要转换为 [x, y, width, height]
+        boxes_xywh = np.zeros_like(boxes)
+        boxes_xywh[:, 0] = boxes[:, 0]  # x
+        boxes_xywh[:, 1] = boxes[:, 1]  # y
+        boxes_xywh[:, 2] = boxes[:, 2] - boxes[:, 0]  # width = x2 - x1
+        boxes_xywh[:, 3] = boxes[:, 3] - boxes[:, 1]  # height = y2 - y1
+        
         # 使用OpenCV的NMS
         indices = cv2.dnn.NMSBoxes(
-            boxes.tolist(), scores.tolist(), 
+            boxes_xywh.tolist(), scores.tolist(), 
             self.conf_thres, self.iou_thres
         )
         
@@ -991,28 +1052,41 @@ class OnnxDetector(BaseDetector):
         self.max_det = max_det
 
     def _preprocess(self, img_bgr):
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.input_size, self.input_size))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]
-        return np.ascontiguousarray(img)
+        """优化的预处理：最小化内存拷贝"""
+        # 直接在resize中进行插值，避免额外的copy
+        # INTER_LINEAR是最快的插值方法
+        img_resized = cv2.resize(img_bgr, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        
+        # 使用cvtColor直接转换，OpenCV内部优化
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        
+        # 归一化并转换为float32，避免中间拷贝
+        img_normalized = img_rgb.astype(np.float32) * (1.0 / 255.0)
+        
+        # 转置并添加batch维度
+        img_transposed = np.transpose(img_normalized, (2, 0, 1))[None, ...]
+        
+        # 确保连续内存布局（通常已经是连续的）
+        return np.ascontiguousarray(img_transposed)
 
     def infer(self, frame_bgr, roi=None, downsample_ratio=1.0):
-        # 如果没有ROI，则全屏识别
+        # ROI提取（不拷贝，使用view）
         if roi is None:
             img = frame_bgr
             roi_top, roi_left = 0, 0
         else:
             x, y, w, h = roi
+            # 使用numpy的view而不是copy，减少内存拷贝
             img = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
         
-        # 应用下采样
+        # 应用下采样（如果需要）
         if downsample_ratio != 1.0 and downsample_ratio > 0:
             orig_h, orig_w = img.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img = cv2.resize(img, (new_w, new_h))
+            # 使用INTER_LINEAR进行快速下采样
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -1073,15 +1147,27 @@ class OnnxDetector(BaseDetector):
         return dets
     
     def _apply_nms(self, detections):
-        """应用非极大值抑制"""
+        """应用非极大值抑制（带top-k预过滤优化）"""
         if not detections:
             return []
+        
+        # Top-K预过滤：按置信度排序，只保留前TOP_K_BEFORE_NMS个
+        if len(detections) > TOP_K_BEFORE_NMS:
+            detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:TOP_K_BEFORE_NMS]
         
         boxes = np.array([d['bbox'] for d in detections])
         scores = np.array([d['confidence'] for d in detections])
         
+        # 转换boxes从xyxy格式到xywh格式（OpenCV NMS要求xywh）
+        # boxes当前是 [x1, y1, x2, y2]，需要转换为 [x, y, width, height]
+        boxes_xywh = np.zeros_like(boxes)
+        boxes_xywh[:, 0] = boxes[:, 0]  # x
+        boxes_xywh[:, 1] = boxes[:, 1]  # y
+        boxes_xywh[:, 2] = boxes[:, 2] - boxes[:, 0]  # width = x2 - x1
+        boxes_xywh[:, 3] = boxes[:, 3] - boxes[:, 1]  # height = y2 - y1
+        
         indices = cv2.dnn.NMSBoxes(
-            boxes.tolist(), scores.tolist(), 
+            boxes_xywh.tolist(), scores.tolist(), 
             self.conf_thres, self.iou_thres
         )
         
@@ -1104,12 +1190,13 @@ class PtDetector(BaseDetector):
         self.names = self.model.names
 
     def infer(self, frame_bgr, roi=None, downsample_ratio=1.0):
-        # 如果没有ROI，则全屏识别
+        # ROI提取（使用view）
         if roi is None:
             img0 = frame_bgr
             roi_top, roi_left = 0, 0
         else:
             x, y, w, h = roi
+            # 使用numpy的view而不是copy
             img0 = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
             
@@ -1118,7 +1205,8 @@ class PtDetector(BaseDetector):
             orig_h, orig_w = img0.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img0 = cv2.resize(img0, (new_w, new_h))
+            # 使用INTER_LINEAR进行快速下采样
+            img0 = cv2.resize(img0, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -1445,6 +1533,12 @@ class CameraThread(QThread):
         
         # 下采样参数
         self.downsample_ratio = DOWNSAMPLE_RATIO_DEFAULT
+        self.detector_downsample_ratio = DETECTOR_DOWNSAMPLE_RATIO  # 检测器专用下采样
+        
+        # 推理控制参数
+        self.inference_interval = INFERENCE_INTERVAL  # 推理间隔（帧数）
+        self.top_k_limit = TOP_K_BEFORE_NMS  # Top-K限制
+        self.use_nms = USE_NMS_FOR_YOLO26  # 是否使用NMS
         
         # 统计信息
         self.stats = {
@@ -1461,6 +1555,12 @@ class CameraThread(QThread):
             'long_status': '空闲',
             'count_line_y': 0,
             'roi_info': '全屏',
+            'timing_capture': 0.0,
+            'timing_preprocess': 0.0,
+            'timing_inference': 0.0,
+            'timing_postprocess': 0.0,
+            'timing_draw': 0.0,
+            'timing_total': 0.0,
         }
         
         # 其他变量
@@ -1474,6 +1574,8 @@ class CameraThread(QThread):
         # 性能监控
         self.frame_count = 0
         self.last_fps_time = time.time()
+        self.perf_timer = PerformanceTimer()
+        self.frame_skip_counter = 0  # 用于控制推理间隔
 
         # 长图拼接
         self.long_capturing = False
@@ -1726,12 +1828,17 @@ class CameraThread(QThread):
             print(f"清理资源时出错: {e}")
     
     def run(self):
-        """线程主循环"""
+        """线程主循环 - 优化版：带性能计时和推理间隔控制"""
         self.running = True
+        last_detections = []  # 缓存上次的检测结果
+        last_tracked = []  # 缓存上次的追踪结果
         
         while self.running:
             try:
-                # 采集帧
+                t_loop_start = time.perf_counter()
+                
+                # ===== 1. 采集帧 =====
+                t_cap_start = time.perf_counter()
                 if not self.cam:
                     time.sleep(0.1)
                     continue
@@ -1740,6 +1847,9 @@ class CameraThread(QThread):
                 if frame is None:
                     time.sleep(0.01)
                     continue
+                
+                t_cap_end = time.perf_counter()
+                self.perf_timer.update('capture', t_cap_end - t_cap_start)
                 
                 # 更新原始帧尺寸
                 self.original_frame_height, self.original_frame_width = frame.shape[:2]
@@ -1764,9 +1874,7 @@ class CameraThread(QThread):
                     if result[0] is not None:
                         s_cap, v_cap, age = result
                 
-                # 门控状态：
-                # - 如果 UART 接收关闭或串口不可用，则默认门控开启（允许识别）
-                # - 否则按原有门控逻辑基于最新 CTRL 数据
+                # 门控状态
                 if (not self.enable_uart_rx) or (not SERIAL_AVAILABLE):
                     gate_state = True
                 else:
@@ -1780,7 +1888,6 @@ class CameraThread(QThread):
                 
                 # 长图拼接逻辑
                 if self.enable_uart_rx and SERIAL_AVAILABLE:
-                    # UART 模式：速度>0 开始/继续拼接；<=0 停止并识别
                     if v_cap > 0:
                         if not self.long_capturing:
                             self._start_long_capture(reason="uart_positive_speed")
@@ -1788,30 +1895,50 @@ class CameraThread(QThread):
                     else:
                         if self.long_capturing and self.long_reason == "uart_positive_speed":
                             self._finalize_long_capture(trigger="uart_speed_non_positive")
-                # UART 关闭时不自动控制，由快捷键/按钮触发
-
-                # 检测 - 关键修改：启用计数时只识别ROI区域，不启用时全屏识别
+                
+                # ===== 2. 推理控制：根据inference_interval决定是否执行推理 =====
+                should_infer = False
+                self.frame_skip_counter += 1
+                if self.frame_skip_counter >= self.inference_interval:
+                    should_infer = True
+                    self.frame_skip_counter = 0
+                
+                # ===== 3. 检测（带性能计时）=====
                 detections = []
-                if self.enable_detection and gate_state and self.detector:
+                if should_infer and self.enable_detection and gate_state and self.detector:
                     try:
-                        # 根据是否启用计数决定识别区域
-                        detections = self.detector.infer(frame, self.roi_rect, self.downsample_ratio)
+                        t_infer_start = time.perf_counter()
+                        # 使用detector_downsample_ratio进行推理
+                        detections = self.detector.infer(frame, self.roi_rect, self.detector_downsample_ratio)
+                        t_infer_end = time.perf_counter()
+                        self.perf_timer.update('inference', t_infer_end - t_infer_start)
+                        
                         # 应用最大检测数量限制
                         if len(detections) > self.max_detections:
                             detections = detections[:self.max_detections]
+                        
+                        last_detections = detections  # 缓存结果
                     except Exception as e:
                         print(f"⚠️ 检测失败: {e}")
+                        detections = last_detections  # 使用上次结果
+                else:
+                    # 不推理时使用上次的检测结果
+                    detections = last_detections
                 
                 self.stats['detections'] = len(detections)
                 
-                # 追踪
+                # ===== 4. 追踪（带性能计时）=====
+                t_track_start = time.perf_counter()
                 tracked = []
                 if self.enable_tracking and self.tracker:
                     tracked = self.tracker.update(detections)
+                    last_tracked = tracked
+                t_track_end = time.perf_counter()
+                self.perf_timer.update('postprocess', t_track_end - t_track_start)
                 
                 self.stats['tracked'] = len(tracked)
                 
-                # 过线计数
+                # ===== 5. 过线计数 =====
                 new_cnt = 0
                 if self.enable_counting and self.enable_tracking:
                     new_cnt, self.counted_objects = check_crossing_strict_direction(
@@ -1820,7 +1947,7 @@ class CameraThread(QThread):
                     )
                     self.stats['counted'] = len(self.counted_objects)
                 
-                # 密度检测
+                # ===== 6. 密度检测 =====
                 if self.enable_density_detection and self.density_detector:
                     total_dets = len(detections)
                     if total_dets >= MIN_DETS_FOR_DENSITY:
@@ -1860,14 +1987,32 @@ class CameraThread(QThread):
                         except Exception as e:
                             print(f"⚠️ 发送密度事件失败: {e}")
                 
-                # 绘制检测结果（不显示统计信息）
+                # ===== 7. 绘制检测结果（带性能计时）=====
+                t_draw_start = time.perf_counter()
                 display_frame = self.draw_detections_simple(frame, detections, tracked, gate_state)
+                t_draw_end = time.perf_counter()
+                self.perf_timer.update('draw', t_draw_end - t_draw_start)
                 
-                # 发送处理后的帧和统计信息
+                # 更新总时间
+                t_loop_end = time.perf_counter()
+                self.perf_timer.update('total', t_loop_end - t_loop_start)
+                
+                # 更新性能统计到stats
+                timings = self.perf_timer.get_timings()
+                self.stats['timing_capture'] = timings['capture'] * 1000  # 转换为毫秒
+                self.stats['timing_preprocess'] = timings['preprocess'] * 1000
+                self.stats['timing_inference'] = timings['inference'] * 1000
+                self.stats['timing_postprocess'] = timings['postprocess'] * 1000
+                self.stats['timing_draw'] = timings['draw'] * 1000
+                self.stats['timing_total'] = timings['total'] * 1000
+                
+                # ===== 8. 发送处理后的帧和统计信息到UI =====
                 self.frame_processed.emit(display_frame, self.stats.copy())
                 
-                # 控制处理频率
-                time.sleep(1.0 / VIDEO_DISPLAY_FPS)
+                # ===== 9. 不再在这里限制FPS（移除硬编码throttling）=====
+                # 如果UI_ONLY_FPS_LIMIT为False，可选地在这里添加轻微延迟
+                if not UI_ONLY_FPS_LIMIT:
+                    time.sleep(1.0 / VIDEO_DISPLAY_FPS)
                 
             except Exception as e:
                 print(f"处理帧时出错: {e}")
@@ -2295,6 +2440,47 @@ class MainWindow(QMainWindow):
         downsample_group.setLayout(downsample_layout)
         scroll_layout.addWidget(downsample_group)
         
+        # ===== 性能优化配置组 =====
+        perf_group = QGroupBox("性能优化配置")
+        perf_layout = QGridLayout()
+        
+        # Top-K限制
+        perf_layout.addWidget(QLabel("Top-K限制:"), 0, 0)
+        self.topk_spin = QSpinBox()
+        self.topk_spin.setRange(100, 10000)
+        self.topk_spin.setValue(TOP_K_BEFORE_NMS)
+        self.topk_spin.setSingleStep(100)
+        self.topk_spin.setToolTip("NMS前保留的最高置信度候选数量")
+        perf_layout.addWidget(self.topk_spin, 0, 1)
+        
+        # 推理间隔
+        perf_layout.addWidget(QLabel("推理间隔(帧):"), 0, 2)
+        self.infer_interval_spin = QSpinBox()
+        self.infer_interval_spin.setRange(1, 10)
+        self.infer_interval_spin.setValue(INFERENCE_INTERVAL)
+        self.infer_interval_spin.setToolTip("1=每帧推理, 2=每2帧推理...")
+        perf_layout.addWidget(self.infer_interval_spin, 0, 3)
+        
+        # 检测器下采样比例
+        perf_layout.addWidget(QLabel("检测器下采样:"), 1, 0)
+        self.detector_downsample_combo = QComboBox()
+        for ratio in DOWNSAMPLE_OPTIONS:
+            self.detector_downsample_combo.addItem(f"{ratio:.2f}")
+        self.detector_downsample_combo.setCurrentText(f"{DETECTOR_DOWNSAMPLE_RATIO:.2f}")
+        self.detector_downsample_combo.setToolTip("检测器专用下采样（独立于显示下采样）")
+        perf_layout.addWidget(self.detector_downsample_combo, 1, 1)
+        
+        # UI FPS限制
+        perf_layout.addWidget(QLabel("UI刷新率(fps):"), 1, 2)
+        self.ui_fps_spin = QSpinBox()
+        self.ui_fps_spin.setRange(10, 60)
+        self.ui_fps_spin.setValue(VIDEO_DISPLAY_FPS)
+        self.ui_fps_spin.setToolTip("UI刷新帧率限制")
+        perf_layout.addWidget(self.ui_fps_spin, 1, 3)
+        
+        perf_group.setLayout(perf_layout)
+        scroll_layout.addWidget(perf_group)
+        
         # ===== 千粒重配置组 =====
         tkw_group = QGroupBox("千粒重配置")
         tkw_layout = QGridLayout()
@@ -2653,6 +2839,45 @@ class MainWindow(QMainWindow):
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
         
+        # 性能计时组
+        perf_group = QGroupBox("性能计时 (毫秒)")
+        perf_layout = QGridLayout()
+        
+        # 采集时间
+        perf_layout.addWidget(QLabel("采集:"), 0, 0)
+        self.timing_capture_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_capture_label, 0, 1)
+        
+        # 推理时间
+        perf_layout.addWidget(QLabel("推理:"), 0, 2)
+        self.timing_inference_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_inference_label, 0, 3)
+        
+        # 后处理时间
+        perf_layout.addWidget(QLabel("后处理:"), 1, 0)
+        self.timing_postprocess_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_postprocess_label, 1, 1)
+        
+        # 绘制时间
+        perf_layout.addWidget(QLabel("绘制:"), 1, 2)
+        self.timing_draw_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_draw_label, 1, 3)
+        
+        # 总时间
+        perf_layout.addWidget(QLabel("总时间:"), 2, 0)
+        self.timing_total_label = QLabel("0.0 ms")
+        self.timing_total_label.setStyleSheet("font-weight: bold;")
+        perf_layout.addWidget(self.timing_total_label, 2, 1)
+        
+        # 估算FPS
+        perf_layout.addWidget(QLabel("理论FPS:"), 2, 2)
+        self.timing_fps_label = QLabel("0.0")
+        self.timing_fps_label.setStyleSheet("font-weight: bold;")
+        perf_layout.addWidget(self.timing_fps_label, 2, 3)
+        
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+        
         # 事件日志组
         log_group = QGroupBox("事件日志")
         log_layout = QVBoxLayout()
@@ -2822,6 +3047,12 @@ class MainWindow(QMainWindow):
         
         # 下采样参数
         self.camera_thread.downsample_ratio = float(self.downsample_combo.currentText())
+        self.camera_thread.detector_downsample_ratio = float(self.detector_downsample_combo.currentText())
+        
+        # 性能参数
+        self.camera_thread.inference_interval = self.infer_interval_spin.value()
+        self.camera_thread.top_k_limit = self.topk_spin.value()
+        self.camera_thread.use_nms = self.nms_check.isChecked()
         
         # 其他参数
         self.camera_thread.counting_direction = "up" if self.direction_combo.currentText() == "向上" else "down"
@@ -2860,7 +3091,11 @@ class MainWindow(QMainWindow):
         self.log_event(f"系统启动 - 模型: {os.path.basename(model_path)}")
         self.log_event(f"  计数线位置: {self.count_line_percent}%")
         self.log_event(f"  ROI扩展: 上{self.count_line_top_extend}px, 下{self.count_line_bottom_extend}px")
-        self.log_event(f"  下采样: {self.downsample_ratio:.2f}x")
+        self.log_event(f"  显示下采样: {self.downsample_ratio:.2f}x")
+        self.log_event(f"  检测器下采样: {float(self.detector_downsample_combo.currentText()):.2f}x")
+        self.log_event(f"  推理间隔: {self.infer_interval_spin.value()} 帧")
+        self.log_event(f"  Top-K限制: {self.topk_spin.value()}")
+        self.log_event(f"  NMS: {'启用' if self.nms_check.isChecked() else '禁用'}")
         self.log_event(f"  计数方向: {self.direction_combo.currentText()}")
         self.log_event(f"  计数模式: {'启用' if self.counting_check.isChecked() else '禁用'}")
     
@@ -2900,7 +3135,7 @@ class MainWindow(QMainWindow):
         self.log_event("系统已停止")
     
     def update_video_display(self, frame, stats):
-        """更新视频显示，确保不会超出屏幕"""
+        """更新视频显示，优化版：缓存缩放后的显示帧，使用FastTransformation"""
         try:
             # 保存原始帧尺寸
             self.video_height, self.video_width = frame.shape[:2]
@@ -2933,8 +3168,6 @@ class MainWindow(QMainWindow):
                 available_width = max(100, available_width)
                 available_height = max(100, available_height)
                 
-                # 关键改进：独立检查宽度和高度是否超出，而不是统一缩放
-                
                 # 初始值
                 new_width = width
                 new_height = height
@@ -2955,11 +3188,11 @@ class MainWindow(QMainWindow):
                 
                 # 应用最终的缩放
                 if new_width != width or new_height != height:
-                    # 需要缩放
+                    # 需要缩放 - 使用FastTransformation而非SmoothTransformation以提升性能
                     scaled_pixmap = self.current_pixmap.scaled(
                         new_width, new_height, 
                         Qt.KeepAspectRatio,  # 保持宽高比
-                        Qt.SmoothTransformation
+                        Qt.FastTransformation  # 使用快速变换而非平滑变换
                     )
                     self.video_label.setPixmap(scaled_pixmap)
                     
@@ -3157,6 +3390,21 @@ class MainWindow(QMainWindow):
                 
                 # 计数方向
                 self.counting_direction_label.setText(self.direction_combo.currentText())
+                
+                # 性能计时信息
+                self.timing_capture_label.setText(f"{self.stats.get('timing_capture', 0.0):.2f} ms")
+                self.timing_inference_label.setText(f"{self.stats.get('timing_inference', 0.0):.2f} ms")
+                self.timing_postprocess_label.setText(f"{self.stats.get('timing_postprocess', 0.0):.2f} ms")
+                self.timing_draw_label.setText(f"{self.stats.get('timing_draw', 0.0):.2f} ms")
+                self.timing_total_label.setText(f"{self.stats.get('timing_total', 0.0):.2f} ms")
+                
+                # 理论FPS（基于总时间）
+                total_time_s = self.stats.get('timing_total', 0.0) / 1000.0
+                if total_time_s > 0:
+                    theoretical_fps = 1.0 / total_time_s
+                    self.timing_fps_label.setText(f"{theoretical_fps:.1f}")
+                else:
+                    self.timing_fps_label.setText("0.0")
         
         # 更新状态栏
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
