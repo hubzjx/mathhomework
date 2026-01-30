@@ -882,21 +882,30 @@ class TRTDetector(BaseDetector):
             raise RuntimeError(f"设置TensorRT输入形状失败: {e}")
 
     def _preprocess(self, img_bgr):
-        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (self.input_size, self.input_size))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]
-        return np.ascontiguousarray(img)
+        """优化的预处理：最小化内存拷贝"""
+        # 直接在resize中进行插值，避免额外的copy
+        img_resized = cv2.resize(img_bgr, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        
+        # 使用cvtColor直接转换
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        
+        # 归一化并转换为float32
+        img_normalized = img_rgb.astype(np.float32) * (1.0 / 255.0)
+        
+        # 转置并添加batch维度
+        img_transposed = np.transpose(img_normalized, (2, 0, 1))[None, ...]
+        
+        return np.ascontiguousarray(img_transposed)
 
     def infer(self, frame_bgr, roi=None, downsample_ratio=1.0):
-        # 如果没有ROI，则全屏识别
+        # ROI提取（使用view）
         if roi is None:
             img = frame_bgr
             roi_top, roi_left = 0, 0
-            # 不启用计数时，使用全屏，但为了统一，我们设置roi为全屏
             roi_width, roi_height = img.shape[1], img.shape[0]
         else:
             x, y, w, h = roi
+            # 使用numpy的view而不是copy
             img = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
             roi_width, roi_height = w, h
@@ -906,7 +915,8 @@ class TRTDetector(BaseDetector):
             orig_h, orig_w = img.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img = cv2.resize(img, (new_w, new_h))
+            # 使用INTER_LINEAR进行快速下采样
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -1180,12 +1190,13 @@ class PtDetector(BaseDetector):
         self.names = self.model.names
 
     def infer(self, frame_bgr, roi=None, downsample_ratio=1.0):
-        # 如果没有ROI，则全屏识别
+        # ROI提取（使用view）
         if roi is None:
             img0 = frame_bgr
             roi_top, roi_left = 0, 0
         else:
             x, y, w, h = roi
+            # 使用numpy的view而不是copy
             img0 = frame_bgr[y:y + h, x:x + w]
             roi_top, roi_left = y, x
             
@@ -1194,7 +1205,8 @@ class PtDetector(BaseDetector):
             orig_h, orig_w = img0.shape[:2]
             new_w = int(orig_w * downsample_ratio)
             new_h = int(orig_h * downsample_ratio)
-            img0 = cv2.resize(img0, (new_w, new_h))
+            # 使用INTER_LINEAR进行快速下采样
+            img0 = cv2.resize(img0, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             scale_factor = 1.0 / downsample_ratio
         else:
             scale_factor = 1.0
@@ -2428,6 +2440,47 @@ class MainWindow(QMainWindow):
         downsample_group.setLayout(downsample_layout)
         scroll_layout.addWidget(downsample_group)
         
+        # ===== 性能优化配置组 =====
+        perf_group = QGroupBox("性能优化配置")
+        perf_layout = QGridLayout()
+        
+        # Top-K限制
+        perf_layout.addWidget(QLabel("Top-K限制:"), 0, 0)
+        self.topk_spin = QSpinBox()
+        self.topk_spin.setRange(100, 10000)
+        self.topk_spin.setValue(TOP_K_BEFORE_NMS)
+        self.topk_spin.setSingleStep(100)
+        self.topk_spin.setToolTip("NMS前保留的最高置信度候选数量")
+        perf_layout.addWidget(self.topk_spin, 0, 1)
+        
+        # 推理间隔
+        perf_layout.addWidget(QLabel("推理间隔(帧):"), 0, 2)
+        self.infer_interval_spin = QSpinBox()
+        self.infer_interval_spin.setRange(1, 10)
+        self.infer_interval_spin.setValue(INFERENCE_INTERVAL)
+        self.infer_interval_spin.setToolTip("1=每帧推理, 2=每2帧推理...")
+        perf_layout.addWidget(self.infer_interval_spin, 0, 3)
+        
+        # 检测器下采样比例
+        perf_layout.addWidget(QLabel("检测器下采样:"), 1, 0)
+        self.detector_downsample_combo = QComboBox()
+        for ratio in DOWNSAMPLE_OPTIONS:
+            self.detector_downsample_combo.addItem(f"{ratio:.2f}")
+        self.detector_downsample_combo.setCurrentText(f"{DETECTOR_DOWNSAMPLE_RATIO:.2f}")
+        self.detector_downsample_combo.setToolTip("检测器专用下采样（独立于显示下采样）")
+        perf_layout.addWidget(self.detector_downsample_combo, 1, 1)
+        
+        # UI FPS限制
+        perf_layout.addWidget(QLabel("UI刷新率(fps):"), 1, 2)
+        self.ui_fps_spin = QSpinBox()
+        self.ui_fps_spin.setRange(10, 60)
+        self.ui_fps_spin.setValue(VIDEO_DISPLAY_FPS)
+        self.ui_fps_spin.setToolTip("UI刷新帧率限制")
+        perf_layout.addWidget(self.ui_fps_spin, 1, 3)
+        
+        perf_group.setLayout(perf_layout)
+        scroll_layout.addWidget(perf_group)
+        
         # ===== 千粒重配置组 =====
         tkw_group = QGroupBox("千粒重配置")
         tkw_layout = QGridLayout()
@@ -2786,6 +2839,45 @@ class MainWindow(QMainWindow):
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
         
+        # 性能计时组
+        perf_group = QGroupBox("性能计时 (毫秒)")
+        perf_layout = QGridLayout()
+        
+        # 采集时间
+        perf_layout.addWidget(QLabel("采集:"), 0, 0)
+        self.timing_capture_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_capture_label, 0, 1)
+        
+        # 推理时间
+        perf_layout.addWidget(QLabel("推理:"), 0, 2)
+        self.timing_inference_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_inference_label, 0, 3)
+        
+        # 后处理时间
+        perf_layout.addWidget(QLabel("后处理:"), 1, 0)
+        self.timing_postprocess_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_postprocess_label, 1, 1)
+        
+        # 绘制时间
+        perf_layout.addWidget(QLabel("绘制:"), 1, 2)
+        self.timing_draw_label = QLabel("0.0 ms")
+        perf_layout.addWidget(self.timing_draw_label, 1, 3)
+        
+        # 总时间
+        perf_layout.addWidget(QLabel("总时间:"), 2, 0)
+        self.timing_total_label = QLabel("0.0 ms")
+        self.timing_total_label.setStyleSheet("font-weight: bold;")
+        perf_layout.addWidget(self.timing_total_label, 2, 1)
+        
+        # 估算FPS
+        perf_layout.addWidget(QLabel("理论FPS:"), 2, 2)
+        self.timing_fps_label = QLabel("0.0")
+        self.timing_fps_label.setStyleSheet("font-weight: bold;")
+        perf_layout.addWidget(self.timing_fps_label, 2, 3)
+        
+        perf_group.setLayout(perf_layout)
+        layout.addWidget(perf_group)
+        
         # 事件日志组
         log_group = QGroupBox("事件日志")
         log_layout = QVBoxLayout()
@@ -2955,6 +3047,12 @@ class MainWindow(QMainWindow):
         
         # 下采样参数
         self.camera_thread.downsample_ratio = float(self.downsample_combo.currentText())
+        self.camera_thread.detector_downsample_ratio = float(self.detector_downsample_combo.currentText())
+        
+        # 性能参数
+        self.camera_thread.inference_interval = self.infer_interval_spin.value()
+        self.camera_thread.top_k_limit = self.topk_spin.value()
+        self.camera_thread.use_nms = self.nms_check.isChecked()
         
         # 其他参数
         self.camera_thread.counting_direction = "up" if self.direction_combo.currentText() == "向上" else "down"
@@ -2993,7 +3091,11 @@ class MainWindow(QMainWindow):
         self.log_event(f"系统启动 - 模型: {os.path.basename(model_path)}")
         self.log_event(f"  计数线位置: {self.count_line_percent}%")
         self.log_event(f"  ROI扩展: 上{self.count_line_top_extend}px, 下{self.count_line_bottom_extend}px")
-        self.log_event(f"  下采样: {self.downsample_ratio:.2f}x")
+        self.log_event(f"  显示下采样: {self.downsample_ratio:.2f}x")
+        self.log_event(f"  检测器下采样: {float(self.detector_downsample_combo.currentText()):.2f}x")
+        self.log_event(f"  推理间隔: {self.infer_interval_spin.value()} 帧")
+        self.log_event(f"  Top-K限制: {self.topk_spin.value()}")
+        self.log_event(f"  NMS: {'启用' if self.nms_check.isChecked() else '禁用'}")
         self.log_event(f"  计数方向: {self.direction_combo.currentText()}")
         self.log_event(f"  计数模式: {'启用' if self.counting_check.isChecked() else '禁用'}")
     
@@ -3288,6 +3390,21 @@ class MainWindow(QMainWindow):
                 
                 # 计数方向
                 self.counting_direction_label.setText(self.direction_combo.currentText())
+                
+                # 性能计时信息
+                self.timing_capture_label.setText(f"{self.stats.get('timing_capture', 0.0):.2f} ms")
+                self.timing_inference_label.setText(f"{self.stats.get('timing_inference', 0.0):.2f} ms")
+                self.timing_postprocess_label.setText(f"{self.stats.get('timing_postprocess', 0.0):.2f} ms")
+                self.timing_draw_label.setText(f"{self.stats.get('timing_draw', 0.0):.2f} ms")
+                self.timing_total_label.setText(f"{self.stats.get('timing_total', 0.0):.2f} ms")
+                
+                # 理论FPS（基于总时间）
+                total_time_s = self.stats.get('timing_total', 0.0) / 1000.0
+                if total_time_s > 0:
+                    theoretical_fps = 1.0 / total_time_s
+                    self.timing_fps_label.setText(f"{theoretical_fps:.1f}")
+                else:
+                    self.timing_fps_label.setText("0.0")
         
         # 更新状态栏
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
