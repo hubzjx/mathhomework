@@ -163,6 +163,11 @@ TOP_K_BEFORE_NMS = 1000    # NMS前保留的最高置信度候选数量（优化
 INFERENCE_INTERVAL = 1     # 推理间隔（帧），1=每帧推理，2=每2帧推理...
 DETECTOR_DOWNSAMPLE_RATIO = 1.0  # 检测器专用下采样（独立于显示下采样）
 
+# 异步pipeline配置
+ENABLE_ASYNC_PIPELINE = True  # 启用异步采集和推理pipeline
+CAPTURE_QUEUE_SIZE = 2  # 采集队列大小（小队列实现drop-frame latest-only）
+RESULT_QUEUE_SIZE = 5  # 结果队列大小
+
 # EVENT 发送队列
 EVENT_QUEUE_MAX = 2000
 
@@ -237,6 +242,69 @@ class PerformanceTimer:
         if self.timings['total'] > 0:
             return 1.0 / self.timings['total']
         return 0.0
+
+
+# ===== 下降帧队列（Latest-Only Queue）=====
+class LatestOnlyQueue:
+    """
+    只保留最新数据的队列，旧数据会被丢弃
+    当队列满时，新数据会覆盖最旧的数据
+    """
+    def __init__(self, maxsize=2):
+        self.maxsize = maxsize
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.dropped_count = 0
+        self.total_count = 0
+        self.lock = threading.Lock()
+    
+    def put(self, item, block=False):
+        """
+        放入数据，如果队列满则丢弃最旧的数据
+        """
+        with self.lock:
+            self.total_count += 1
+            # 如果队列满，清空队列只保留最新的
+            if self.queue.full():
+                # 清空队列
+                dropped = 0
+                while not self.queue.empty():
+                    try:
+                        self.queue.get_nowait()
+                        dropped += 1
+                    except queue.Empty:
+                        break
+                self.dropped_count += dropped
+            
+            # 放入新数据
+            try:
+                self.queue.put_nowait(item)
+            except queue.Full:
+                # 理论上不应该发生，因为我们已经清空了
+                self.dropped_count += 1
+    
+    def get(self, block=True, timeout=None):
+        """获取数据"""
+        return self.queue.get(block=block, timeout=timeout)
+    
+    def empty(self):
+        """检查是否为空"""
+        return self.queue.empty()
+    
+    def get_stats(self):
+        """获取统计信息"""
+        with self.lock:
+            drop_rate = self.dropped_count / max(1, self.total_count)
+            return {
+                'total': self.total_count,
+                'dropped': self.dropped_count,
+                'drop_rate': drop_rate
+            }
+    
+    def reset_stats(self):
+        """重置统计信息"""
+        with self.lock:
+            self.dropped_count = 0
+            self.total_count = 0
 
 
 # ===== 控制数据结构与对齐 =====
@@ -1561,6 +1629,11 @@ class CameraThread(QThread):
             'timing_postprocess': 0.0,
             'timing_draw': 0.0,
             'timing_total': 0.0,
+            'async_mode': False,
+            'frames_dropped': 0,
+            'drop_rate': 0.0,
+            'capture_queue_size': 0,
+            'result_queue_size': 0,
         }
         
         # 其他变量
@@ -1576,6 +1649,14 @@ class CameraThread(QThread):
         self.last_fps_time = time.time()
         self.perf_timer = PerformanceTimer()
         self.frame_skip_counter = 0  # 用于控制推理间隔
+        
+        # 异步pipeline支持
+        self.enable_async_pipeline = ENABLE_ASYNC_PIPELINE
+        self.capture_queue = None  # LatestOnlyQueue for frames
+        self.result_queue = None   # queue.Queue for inference results
+        self.capture_thread = None
+        self.inference_thread = None
+        self.async_running = False
 
         # 长图拼接
         self.long_capturing = False
@@ -1827,9 +1908,320 @@ class CameraThread(QThread):
         except Exception as e:
             print(f"清理资源时出错: {e}")
     
+    def _capture_worker(self):
+        """异步采集线程：持续采集帧并放入队列"""
+        print("📷 启动异步采集线程")
+        while self.async_running:
+            try:
+                t_cap_start = time.perf_counter()
+                
+                if not self.cam:
+                    time.sleep(0.1)
+                    continue
+                
+                frame = self.cam.capture_frame_alternative()
+                if frame is None:
+                    time.sleep(0.01)
+                    continue
+                
+                t_cap_end = time.perf_counter()
+                cap_time = t_cap_end - t_cap_start
+                
+                # 将帧和时间戳放入队列（latest-only，会自动丢弃旧帧）
+                self.capture_queue.put({
+                    'frame': frame,
+                    't_cap': time.monotonic(),
+                    'cap_duration': cap_time
+                })
+                
+            except Exception as e:
+                print(f"⚠️ 采集线程错误: {e}")
+                time.sleep(0.01)
+        
+        print("📷 异步采集线程已停止")
+    
+    def _inference_worker(self):
+        """异步推理线程：从队列取帧并执行推理"""
+        print("🔍 启动异步推理线程")
+        
+        while self.async_running:
+            try:
+                # 从采集队列获取帧（阻塞等待）
+                try:
+                    item = self.capture_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                
+                frame = item['frame']
+                t_cap_host = item['t_cap']
+                cap_duration = item['cap_duration']
+                
+                # 更新原始帧尺寸
+                self.original_frame_height, self.original_frame_width = frame.shape[:2]
+                
+                # 更新计数线位置和ROI区域
+                self.update_count_line_and_roi(frame)
+                
+                # 时间对齐 - 安全访问 ctrl_buf
+                s_cap, v_cap, age = (0, 0, 999)
+                if self.ctrl_buf:
+                    result = self.ctrl_buf.query_s_at_host_time(t_cap_host)
+                    if result[0] is not None:
+                        s_cap, v_cap, age = result
+                
+                # 门控状态
+                if (not self.enable_uart_rx) or (not SERIAL_AVAILABLE):
+                    gate_state = True
+                else:
+                    gate_state = False
+                    if age <= GATE_MAX_AGE and self.ctrl_buf:
+                        gate_state = self.ctrl_buf.gate_enabled(max_age=GATE_MAX_AGE)
+                
+                # 执行推理
+                t_infer_start = time.perf_counter()
+                detections = []
+                
+                if self.enable_detection and gate_state and self.detector:
+                    try:
+                        detections = self.detector.infer(frame, self.roi_rect, self.detector_downsample_ratio)
+                        
+                        # 应用最大检测数量限制
+                        if len(detections) > self.max_detections:
+                            detections = detections[:self.max_detections]
+                    except Exception as e:
+                        print(f"⚠️ 推理失败: {e}")
+                
+                t_infer_end = time.perf_counter()
+                infer_duration = t_infer_end - t_infer_start
+                
+                # 将结果放入结果队列
+                try:
+                    self.result_queue.put({
+                        'frame': frame,
+                        'detections': detections,
+                        's_cap': s_cap,
+                        'v_cap': v_cap,
+                        'age': age,
+                        'gate_state': gate_state,
+                        't_cap_host': t_cap_host,
+                        'cap_duration': cap_duration,
+                        'infer_duration': infer_duration
+                    }, block=False)
+                except queue.Full:
+                    # 如果结果队列满，丢弃这个结果
+                    pass
+                    
+            except Exception as e:
+                print(f"⚠️ 推理线程错误: {e}")
+                time.sleep(0.01)
+        
+        print("🔍 异步推理线程已停止")
+    
+    def _start_async_pipeline(self):
+        """启动异步pipeline"""
+        if self.async_running:
+            return
+        
+        print("🚀 启动异步pipeline...")
+        self.capture_queue = LatestOnlyQueue(maxsize=CAPTURE_QUEUE_SIZE)
+        self.result_queue = queue.Queue(maxsize=RESULT_QUEUE_SIZE)
+        self.async_running = True
+        
+        self.capture_thread = threading.Thread(target=self._capture_worker, daemon=True)
+        self.inference_thread = threading.Thread(target=self._inference_worker, daemon=True)
+        
+        self.capture_thread.start()
+        self.inference_thread.start()
+        
+        self.stats['async_mode'] = True
+        print("✅ 异步pipeline已启动")
+    
+    def _stop_async_pipeline(self):
+        """停止异步pipeline"""
+        if not self.async_running:
+            return
+        
+        print("🛑 停止异步pipeline...")
+        self.async_running = False
+        
+        # 等待线程结束
+        if self.capture_thread:
+            self.capture_thread.join(timeout=2.0)
+        if self.inference_thread:
+            self.inference_thread.join(timeout=2.0)
+        
+        self.stats['async_mode'] = False
+        print("✅ 异步pipeline已停止")
+    
     def run(self):
-        """线程主循环 - 优化版：带性能计时和推理间隔控制"""
+        """线程主循环 - 支持同步和异步pipeline"""
         self.running = True
+        
+        # 如果启用异步pipeline，启动异步线程
+        if self.enable_async_pipeline:
+            self._start_async_pipeline()
+            self._run_async_consumer()
+        else:
+            self._run_sync_pipeline()
+    
+    def _run_async_consumer(self):
+        """异步模式：从结果队列消费推理结果"""
+        last_tracked = []
+        
+        while self.running:
+            try:
+                t_loop_start = time.perf_counter()
+                
+                # 从结果队列获取推理结果
+                try:
+                    result = self.result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    # 更新队列统计
+                    if self.capture_queue:
+                        stats = self.capture_queue.get_stats()
+                        self.stats['frames_dropped'] = stats['dropped']
+                        self.stats['drop_rate'] = stats['drop_rate']
+                        self.stats['capture_queue_size'] = self.capture_queue.queue.qsize()
+                    if self.result_queue:
+                        self.stats['result_queue_size'] = self.result_queue.qsize()
+                    continue
+                
+                frame = result['frame']
+                detections = result['detections']
+                s_cap = result['s_cap']
+                v_cap = result['v_cap']
+                age = result['age']
+                gate_state = result['gate_state']
+                t_cap_host = result['t_cap_host']
+                cap_duration = result['cap_duration']
+                infer_duration = result['infer_duration']
+                
+                # 更新性能计时
+                self.perf_timer.update('capture', cap_duration)
+                self.perf_timer.update('inference', infer_duration)
+                
+                # 更新FPS
+                self.frame_count += 1
+                current_time = time.time()
+                if current_time - self.last_fps_time >= 1.0:
+                    self.stats['fps'] = self.frame_count
+                    self.frame_count = 0
+                    self.last_fps_time = current_time
+                
+                self.stats['gate_state'] = gate_state
+                self.stats['s_mm'] = s_cap
+                self.stats['v_mmps'] = v_cap
+                self.stats['detections'] = len(detections)
+                
+                # 更新队列统计
+                if self.capture_queue:
+                    stats = self.capture_queue.get_stats()
+                    self.stats['frames_dropped'] = stats['dropped']
+                    self.stats['drop_rate'] = stats['drop_rate']
+                    self.stats['capture_queue_size'] = self.capture_queue.queue.qsize()
+                if self.result_queue:
+                    self.stats['result_queue_size'] = self.result_queue.qsize()
+                
+                # 长图拼接逻辑
+                if self.enable_uart_rx and SERIAL_AVAILABLE:
+                    if v_cap > 0:
+                        if not self.long_capturing:
+                            self._start_long_capture(reason="uart_positive_speed")
+                        self._append_long_frame(frame)
+                    else:
+                        if self.long_capturing and self.long_reason == "uart_positive_speed":
+                            self._finalize_long_capture(trigger="uart_speed_non_positive")
+                
+                # ===== 追踪（带性能计时）=====
+                t_track_start = time.perf_counter()
+                tracked = []
+                if self.enable_tracking and self.tracker:
+                    tracked = self.tracker.update(detections)
+                    last_tracked = tracked
+                t_track_end = time.perf_counter()
+                self.perf_timer.update('postprocess', t_track_end - t_track_start)
+                
+                self.stats['tracked'] = len(tracked)
+                
+                # ===== 过线计数 =====
+                new_cnt = 0
+                if self.enable_counting and self.enable_tracking:
+                    new_cnt, self.counted_objects = check_crossing_strict_direction(
+                        tracked, self.count_line_y, self.counted_objects, 
+                        self.counting_direction, count_zone=self.count_zone
+                    )
+                    self.stats['counted'] = len(self.counted_objects)
+                
+                # ===== 密度检测 =====
+                if self.enable_density_detection and self.density_detector:
+                    total_dets = len(detections)
+                    if total_dets >= MIN_DETS_FOR_DENSITY:
+                        density_map = self.density_detector.compute_density_map(detections, self.roi_rect)
+                        segs, col_sum, mean, thr = self.density_detector.low_density_columns(density_map)
+                        has_low = len(segs) > 0
+                    else:
+                        has_low = False
+                    
+                    self.stats['low_density'] = has_low
+                    
+                    seg = self.density_detector.update_segment_state(has_low, s_cap, 
+                                                                    seed_count_frame=len(detections))
+                    if seg and self.event_sender:
+                        try:
+                            s_start, s_end, seed_sum = seg
+                            weight_g = seed_count_to_grams(seed_sum, SEED_TKW_GRAMS)
+                            weight_mg = grams_to_mg_u32(weight_g)
+                            
+                            if self.seg_cache:
+                                self.seg_cache.add_segment(
+                                    s_start=s_start,
+                                    s_end=s_end,
+                                    seed_count_sum=seed_sum,
+                                    weight_mg=weight_mg
+                                )
+                            
+                            self.event_sender.send_low_density_segment(
+                                event_id=self.event_id,
+                                severity=255,
+                                s_start_mm=s_start,
+                                s_end_mm=s_end,
+                                seed_count=seed_sum,
+                                weight_mg=weight_mg
+                            )
+                            self.event_id = (self.event_id + 1) & 0xFFFF
+                        except Exception as e:
+                            print(f"⚠️ 发送密度事件失败: {e}")
+                
+                # ===== 绘制检测结果（带性能计时）=====
+                t_draw_start = time.perf_counter()
+                display_frame = self.draw_detections_simple(frame, detections, tracked, gate_state)
+                t_draw_end = time.perf_counter()
+                self.perf_timer.update('draw', t_draw_end - t_draw_start)
+                
+                # 更新总时间
+                t_loop_end = time.perf_counter()
+                self.perf_timer.update('total', t_loop_end - t_loop_start)
+                
+                # 更新性能统计到stats
+                timings = self.perf_timer.get_timings()
+                self.stats['timing_capture'] = timings['capture'] * 1000
+                self.stats['timing_preprocess'] = timings['preprocess'] * 1000
+                self.stats['timing_inference'] = timings['inference'] * 1000
+                self.stats['timing_postprocess'] = timings['postprocess'] * 1000
+                self.stats['timing_draw'] = timings['draw'] * 1000
+                self.stats['timing_total'] = timings['total'] * 1000
+                
+                # ===== 发送处理后的帧和统计信息到UI =====
+                self.frame_processed.emit(display_frame, self.stats.copy())
+                
+                # 不再限制FPS - 让其尽可能快地处理
+                
+            except Exception as e:
+                print(f"异步消费处理帧时出错: {e}")
+                time.sleep(0.01)
+    
+    def _run_sync_pipeline(self):
+        """同步模式：传统的采集-推理-处理流程"""
         last_detections = []  # 缓存上次的检测结果
         last_tracked = []  # 缓存上次的追踪结果
         
@@ -2009,10 +2401,10 @@ class CameraThread(QThread):
                 # ===== 8. 发送处理后的帧和统计信息到UI =====
                 self.frame_processed.emit(display_frame, self.stats.copy())
                 
-                # ===== 9. 不再在这里限制FPS（移除硬编码throttling）=====
-                # 如果UI_ONLY_FPS_LIMIT为False，可选地在这里添加轻微延迟
-                if not UI_ONLY_FPS_LIMIT:
-                    time.sleep(1.0 / VIDEO_DISPLAY_FPS)
+                # ===== 9. 移除FPS throttling以获得最大性能 =====
+                # 注释掉原来的FPS限制代码，让pipeline全速运行
+                # if not UI_ONLY_FPS_LIMIT:
+                #     time.sleep(1.0 / VIDEO_DISPLAY_FPS)
                 
             except Exception as e:
                 print(f"处理帧时出错: {e}")
@@ -2098,6 +2490,10 @@ class CameraThread(QThread):
     def stop(self):
         """停止线程"""
         self.running = False
+        
+        # 停止异步pipeline（如果启用）
+        if self.enable_async_pipeline:
+            self._stop_async_pipeline()
         
         # 清理资源 - 使用安全访问方式
         try:
@@ -2444,39 +2840,54 @@ class MainWindow(QMainWindow):
         perf_group = QGroupBox("性能优化配置")
         perf_layout = QGridLayout()
         
+        # 异步Pipeline开关
+        perf_layout.addWidget(QLabel("异步Pipeline:"), 0, 0)
+        self.async_pipeline_check = QCheckBox("启用")
+        self.async_pipeline_check.setChecked(ENABLE_ASYNC_PIPELINE)
+        self.async_pipeline_check.setToolTip("启用异步采集和推理，提升性能")
+        perf_layout.addWidget(self.async_pipeline_check, 0, 1)
+        
+        # 采集队列大小
+        perf_layout.addWidget(QLabel("采集队列大小:"), 0, 2)
+        self.capture_queue_spin = QSpinBox()
+        self.capture_queue_spin.setRange(1, 10)
+        self.capture_queue_spin.setValue(CAPTURE_QUEUE_SIZE)
+        self.capture_queue_spin.setToolTip("采集队列大小，越小则越多丢帧但延迟越低")
+        perf_layout.addWidget(self.capture_queue_spin, 0, 3)
+        
         # Top-K限制
-        perf_layout.addWidget(QLabel("Top-K限制:"), 0, 0)
+        perf_layout.addWidget(QLabel("Top-K限制:"), 1, 0)
         self.topk_spin = QSpinBox()
         self.topk_spin.setRange(100, 10000)
         self.topk_spin.setValue(TOP_K_BEFORE_NMS)
         self.topk_spin.setSingleStep(100)
         self.topk_spin.setToolTip("NMS前保留的最高置信度候选数量")
-        perf_layout.addWidget(self.topk_spin, 0, 1)
+        perf_layout.addWidget(self.topk_spin, 1, 1)
         
         # 推理间隔
-        perf_layout.addWidget(QLabel("推理间隔(帧):"), 0, 2)
+        perf_layout.addWidget(QLabel("推理间隔(帧):"), 1, 2)
         self.infer_interval_spin = QSpinBox()
         self.infer_interval_spin.setRange(1, 10)
         self.infer_interval_spin.setValue(INFERENCE_INTERVAL)
         self.infer_interval_spin.setToolTip("1=每帧推理, 2=每2帧推理...")
-        perf_layout.addWidget(self.infer_interval_spin, 0, 3)
+        perf_layout.addWidget(self.infer_interval_spin, 1, 3)
         
         # 检测器下采样比例
-        perf_layout.addWidget(QLabel("检测器下采样:"), 1, 0)
+        perf_layout.addWidget(QLabel("检测器下采样:"), 2, 0)
         self.detector_downsample_combo = QComboBox()
         for ratio in DOWNSAMPLE_OPTIONS:
             self.detector_downsample_combo.addItem(f"{ratio:.2f}")
         self.detector_downsample_combo.setCurrentText(f"{DETECTOR_DOWNSAMPLE_RATIO:.2f}")
         self.detector_downsample_combo.setToolTip("检测器专用下采样（独立于显示下采样）")
-        perf_layout.addWidget(self.detector_downsample_combo, 1, 1)
+        perf_layout.addWidget(self.detector_downsample_combo, 2, 1)
         
         # UI FPS限制
-        perf_layout.addWidget(QLabel("UI刷新率(fps):"), 1, 2)
+        perf_layout.addWidget(QLabel("UI刷新率(fps):"), 2, 2)
         self.ui_fps_spin = QSpinBox()
         self.ui_fps_spin.setRange(10, 60)
         self.ui_fps_spin.setValue(VIDEO_DISPLAY_FPS)
         self.ui_fps_spin.setToolTip("UI刷新帧率限制")
-        perf_layout.addWidget(self.ui_fps_spin, 1, 3)
+        perf_layout.addWidget(self.ui_fps_spin, 2, 3)
         
         perf_group.setLayout(perf_layout)
         scroll_layout.addWidget(perf_group)
@@ -2878,6 +3289,39 @@ class MainWindow(QMainWindow):
         perf_group.setLayout(perf_layout)
         layout.addWidget(perf_group)
         
+        # 异步Pipeline统计组（新增）
+        async_group = QGroupBox("异步Pipeline统计")
+        async_layout = QGridLayout()
+        
+        # 异步模式状态
+        async_layout.addWidget(QLabel("异步模式:"), 0, 0)
+        self.async_mode_label = QLabel("未启用")
+        self.async_mode_label.setStyleSheet("color: gray; font-weight: bold;")
+        async_layout.addWidget(self.async_mode_label, 0, 1)
+        
+        # 丢帧数量
+        async_layout.addWidget(QLabel("丢帧数:"), 0, 2)
+        self.frames_dropped_label = QLabel("0")
+        async_layout.addWidget(self.frames_dropped_label, 0, 3)
+        
+        # 丢帧率
+        async_layout.addWidget(QLabel("丢帧率:"), 1, 0)
+        self.drop_rate_label = QLabel("0.0%")
+        async_layout.addWidget(self.drop_rate_label, 1, 1)
+        
+        # 采集队列大小
+        async_layout.addWidget(QLabel("采集队列:"), 1, 2)
+        self.capture_queue_label = QLabel("0")
+        async_layout.addWidget(self.capture_queue_label, 1, 3)
+        
+        # 结果队列大小
+        async_layout.addWidget(QLabel("结果队列:"), 2, 0)
+        self.result_queue_label = QLabel("0")
+        async_layout.addWidget(self.result_queue_label, 2, 1)
+        
+        async_group.setLayout(async_layout)
+        layout.addWidget(async_group)
+        
         # 事件日志组
         log_group = QGroupBox("事件日志")
         log_layout = QVBoxLayout()
@@ -3054,6 +3498,9 @@ class MainWindow(QMainWindow):
         self.camera_thread.top_k_limit = self.topk_spin.value()
         self.camera_thread.use_nms = self.nms_check.isChecked()
         
+        # 异步Pipeline参数（新增）
+        self.camera_thread.enable_async_pipeline = self.async_pipeline_check.isChecked()
+        
         # 其他参数
         self.camera_thread.counting_direction = "up" if self.direction_combo.currentText() == "向上" else "down"
         self.camera_thread.max_detections = self.max_det_spin.value()
@@ -3096,6 +3543,9 @@ class MainWindow(QMainWindow):
         self.log_event(f"  推理间隔: {self.infer_interval_spin.value()} 帧")
         self.log_event(f"  Top-K限制: {self.topk_spin.value()}")
         self.log_event(f"  NMS: {'启用' if self.nms_check.isChecked() else '禁用'}")
+        self.log_event(f"  异步Pipeline: {'启用' if self.async_pipeline_check.isChecked() else '禁用'}")
+        if self.async_pipeline_check.isChecked():
+            self.log_event(f"  采集队列大小: {self.capture_queue_spin.value()}")
         self.log_event(f"  计数方向: {self.direction_combo.currentText()}")
         self.log_event(f"  计数模式: {'启用' if self.counting_check.isChecked() else '禁用'}")
     
@@ -3405,6 +3855,25 @@ class MainWindow(QMainWindow):
                     self.timing_fps_label.setText(f"{theoretical_fps:.1f}")
                 else:
                     self.timing_fps_label.setText("0.0")
+                
+                # 异步Pipeline统计信息（新增）
+                async_mode = self.stats.get('async_mode', False)
+                self.async_mode_label.setText("已启用" if async_mode else "未启用")
+                self.async_mode_label.setStyleSheet(
+                    "color: green; font-weight: bold;" if async_mode else "color: gray; font-weight: bold;"
+                )
+                
+                frames_dropped = self.stats.get('frames_dropped', 0)
+                self.frames_dropped_label.setText(str(frames_dropped))
+                
+                drop_rate = self.stats.get('drop_rate', 0.0) * 100
+                self.drop_rate_label.setText(f"{drop_rate:.1f}%")
+                
+                capture_queue_size = self.stats.get('capture_queue_size', 0)
+                self.capture_queue_label.setText(str(capture_queue_size))
+                
+                result_queue_size = self.stats.get('result_queue_size', 0)
+                self.result_queue_label.setText(str(result_queue_size))
         
         # 更新状态栏
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
